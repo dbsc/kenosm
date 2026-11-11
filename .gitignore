@@ -1,0 +1,12 @@
+/bin/
+.env
+*.local
+config/agents.json
+
+# Agent runtime artifacts (regenerated on each run)
+/workspace/
+/output/
+
+# OS / editor noise
+.DS_Store
+*.swp
