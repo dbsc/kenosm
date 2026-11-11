@@ -9,14 +9,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 // Workspace is a directory that agents can write files into and run commands in.
+// A mutex serializes file operations so that concurrent agents (parallel
+// subtasks) cannot corrupt each other's read-modify-write edits.
 type Workspace struct {
 	root           string
 	commandTimeout time.Duration
+	mu             sync.Mutex
 }
 
 func New(root string, commandTimeout time.Duration) (*Workspace, error) {
@@ -97,6 +101,8 @@ func (w *Workspace) resolve(rel string) (string, error) {
 }
 
 func (w *Workspace) WriteFile(rel, content string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	abs, err := w.resolve(rel)
 	if err != nil {
 		return err
@@ -108,6 +114,8 @@ func (w *Workspace) WriteFile(rel, content string) error {
 }
 
 func (w *Workspace) ReadFile(rel string) (string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	abs, err := w.resolve(rel)
 	if err != nil {
 		return "", err
@@ -125,6 +133,8 @@ type FileInfo struct {
 }
 
 func (w *Workspace) ListFiles() ([]FileInfo, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	out := make([]FileInfo, 0)
 	err := filepath.Walk(w.root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -150,6 +160,8 @@ func (w *Workspace) ListFiles() ([]FileInfo, error) {
 // EditFile replaces every occurrence of oldStr with newStr in rel and returns
 // how many replacements were made. It errors if oldStr is not present.
 func (w *Workspace) EditFile(rel, oldStr, newStr string) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	abs, err := w.resolve(rel)
 	if err != nil {
 		return 0, err
@@ -174,6 +186,8 @@ func (w *Workspace) EditFile(rel, oldStr, newStr string) (int, error) {
 // using a case-insensitive substring match. Binary and oversized files are
 // skipped.
 func (w *Workspace) Search(query string) ([]string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	q := strings.ToLower(query)
 	var out []string
 	err := filepath.WalkDir(w.root, func(path string, d os.DirEntry, err error) error {

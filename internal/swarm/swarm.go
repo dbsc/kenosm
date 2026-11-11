@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"kenosm/internal/agent"
@@ -78,9 +79,11 @@ type Result struct {
 }
 
 // Run orchestrates the swarm: the orchestrator plans the task and picks a model
-// for each agent, then each worker (with tools) builds and tests files in the
-// shared workspace, sequentially so they build on each other's work. Progress
-// is emitted as Events via cfg.Emitter (if set).
+// for each agent, then workers (with tools) build and test files in the shared
+// workspace. Subtasks that the orchestrator marks as independent (via a
+// "dependencies" map) run concurrently across agents, one subtask per agent at
+// a time; dependent subtasks run after their prerequisites finish. Progress is
+// emitted as Events via cfg.Emitter (if set).
 func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image) (*Result, error) {
 	agents := s.cfg.Agents
 	if len(agents) == 0 {
@@ -101,7 +104,7 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image) (*Resu
 		return nil, fmt.Errorf("build orchestrator: %w", err)
 	}
 
-	plan, assignments, orchUsage, err := s.plan(ctx, orch, task, images)
+	plan, assignments, deps, orchUsage, err := s.plan(ctx, orch, task, images)
 	if err != nil {
 		return nil, fmt.Errorf("planning failed: %w", err)
 	}
@@ -113,37 +116,72 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image) (*Resu
 
 	s.emit(Event{Time: time.Now(), Type: "plan", Detail: fmt.Sprintf("%d subtasks planned", len(plan))})
 
-	for i, sub := range plan {
-		a := agents[i%len(agents)]
-		model := resolveModel(a, assignments, s.cfg.DefaultModel)
-
-		files, _ := s.cfg.Workspace.ListFiles()
-		names := make([]string, 0, len(files))
-		for _, f := range files {
-			names = append(names, f.Path)
+	// If the orchestrator gave no dependency info, fall back to fully
+	// sequential (each subtask depends on the previous) — preserves the
+	// original "build on each other's work" behaviour.
+	if deps == nil {
+		deps = map[int][]int{}
+		for i := 1; i < len(plan); i++ {
+			deps[i] = []int{i - 1}
 		}
-
-		prompt := fmt.Sprintf("Overall task:\n%s\n\nFull plan:\n- %s\n\nCurrent workspace files: %s\n\nYour subtask (%d of %d):\n%s",
-			task, strings.Join(plan, "\n- "), strings.Join(names, ", "), i+1, len(plan), sub)
-
-		s.emit(Event{Time: time.Now(), Type: "subtask", Agent: a.Name, Model: model, Detail: fmt.Sprintf("subtask %d/%d: %s", i+1, len(plan), truncate(sub, 140))})
-
-		agRes, usedModel, aerr := s.runWorker(ctx, a, model, prompt, images)
-
-		sr := SubtaskResult{Task: sub, Agent: a.Name, Model: usedModel}
-		if aerr != nil {
-			sr.Error = aerr.Error()
-			s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: a.Name, Model: usedModel, Detail: "error: " + truncate(aerr.Error(), 240)})
-		} else {
-			sr.Summary = agRes.Summary
-			sr.ToolCalls = agRes.ToolCalls
-			sr.Usage = agRes.Usage
-			s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: a.Name, Model: usedModel, Detail: truncate(agRes.Summary, 240)})
-		}
-		res.Subtasks = append(res.Subtasks, sr)
-		res.Usage = append(res.Usage, UsageRecord{Agent: a.Name, Model: usedModel, Usage: agRes.Usage})
-		s.emit(Event{Time: time.Now(), Type: "usage", Agent: a.Name, Model: usedModel, Usage: agRes.Usage})
 	}
+
+	n := len(plan)
+	subResults := make([]SubtaskResult, n)
+	subUsage := make([]UsageRecord, n)
+
+	// One slot per agent: each key handles at most one subtask at a time, so
+	// parallelism is bounded by (and spread across) the number of keys.
+	slots := make(map[string]chan struct{}, len(agents))
+	for _, a := range agents {
+		slots[a.Slug] = make(chan struct{}, 1)
+	}
+
+	for _, wave := range computeWaves(n, deps) {
+		var wg sync.WaitGroup
+		for pos, idx := range wave {
+			a := agents[pos%len(agents)]
+			model := resolveModel(a, assignments, s.cfg.DefaultModel)
+
+			files, _ := s.cfg.Workspace.ListFiles()
+			names := make([]string, 0, len(files))
+			for _, f := range files {
+				names = append(names, f.Path)
+			}
+			prompt := fmt.Sprintf("Overall task:\n%s\n\nFull plan:\n- %s\n\nCurrent workspace files: %s\n\nYour subtask (%d of %d):\n%s",
+				task, strings.Join(plan, "\n- "), strings.Join(names, ", "), idx+1, n, plan[idx])
+
+			s.emit(Event{Time: time.Now(), Type: "subtask", Agent: a.Name, Model: model, Detail: fmt.Sprintf("subtask %d/%d: %s", idx+1, n, truncate(plan[idx], 140))})
+
+			wg.Add(1)
+			go func(i int, ag Agent, mdl, prmpt string) {
+				defer wg.Done()
+				slot := slots[ag.Slug]
+				slot <- struct{}{}
+				defer func() { <-slot }()
+
+				agRes, usedModel, aerr := s.runWorker(ctx, ag, mdl, prmpt, images)
+
+				sr := SubtaskResult{Task: plan[i], Agent: ag.Name, Model: usedModel}
+				if aerr != nil {
+					sr.Error = aerr.Error()
+					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: "error: " + truncate(aerr.Error(), 240)})
+				} else {
+					sr.Summary = agRes.Summary
+					sr.ToolCalls = agRes.ToolCalls
+					sr.Usage = agRes.Usage
+					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: truncate(agRes.Summary, 240)})
+				}
+				subResults[i] = sr
+				subUsage[i] = UsageRecord{Agent: ag.Name, Model: usedModel, Usage: agRes.Usage}
+				s.emit(Event{Time: time.Now(), Type: "usage", Agent: ag.Name, Model: usedModel, Usage: agRes.Usage})
+			}(idx, a, model, prompt)
+		}
+		wg.Wait()
+	}
+
+	res.Subtasks = subResults
+	res.Usage = append(res.Usage, subUsage...)
 
 	files, _ := s.cfg.Workspace.ListFiles()
 	res.Files = files
@@ -155,6 +193,54 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image) (*Resu
 	res.Final = sb.String()
 
 	return res, nil
+}
+
+// computeWaves groups subtask indices into dependency waves. A task with no
+// prerequisites is in wave 0; a task whose prerequisites are in earlier waves
+// lands in the first wave after them. Tasks within a wave are independent and
+// may run concurrently. Cycles are broken defensively by treating a re-visited
+// task as having no extra prerequisite.
+func computeWaves(n int, deps map[int][]int) [][]int {
+	level := make([]int, n)
+	for i := range level {
+		level[i] = -1
+	}
+	visiting := map[int]bool{}
+	var compute func(i int) int
+	compute = func(i int) int {
+		if level[i] >= 0 {
+			return level[i]
+		}
+		if visiting[i] {
+			return 0
+		}
+		visiting[i] = true
+		l := 0
+		for _, d := range deps[i] {
+			if d < 0 || d >= n || d == i {
+				continue
+			}
+			if dl := compute(d); dl+1 > l {
+				l = dl + 1
+			}
+		}
+		delete(visiting, i)
+		level[i] = l
+		return l
+	}
+
+	maxL := 0
+	for i := 0; i < n; i++ {
+		if l := compute(i); l > maxL {
+			maxL = l
+		}
+	}
+
+	waves := make([][]int, maxL+1)
+	for i := 0; i < n; i++ {
+		waves[level[i]] = append(waves[level[i]], i)
+	}
+	return waves
 }
 
 func (s *Swarm) emit(e Event) {
@@ -170,7 +256,7 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-func (s *Swarm) plan(ctx context.Context, orch *llm.Gemini, task string, images []llm.Image) ([]string, map[string]string, llm.Usage, error) {
+func (s *Swarm) plan(ctx context.Context, orch *llm.Gemini, task string, images []llm.Image) ([]string, map[string]string, map[int][]int, llm.Usage, error) {
 	names := make([]string, 0, len(s.cfg.Agents))
 	for _, a := range s.cfg.Agents {
 		names = append(names, a.Name)
@@ -181,16 +267,19 @@ func (s *Swarm) plan(ctx context.Context, orch *llm.Gemini, task string, images 
 			"Available models: %s\n\n"+
 			"Task:\n%s\n\n"+
 			"Break the task into 3-6 concrete subtasks and choose the best model for each agent.\n"+
-			"Return ONLY a JSON object of the form: {\"plan\": [\"...\"], \"assignments\": {\"<agent name>\": \"<model>\"}}.\n"+
+			"Subtasks that are independent (do not read each other's output) should run in parallel.\n"+
+			"Return ONLY a JSON object of the form:\n"+
+			"{\"plan\": [\"subtask 0\", \"subtask 1\", ...], \"assignments\": {\"<agent name>\": \"<model>\"}, \"dependencies\": {\"<subtask index>\": [<prerequisite indices>]}}.\n"+
+			"The \"dependencies\" field maps a subtask's index (as a string) to the list of indices it must wait for. Independent subtasks have no entry, so \"dependencies\" may be {}.\n"+
 			"No markdown, no code fences, no extra text.",
 		strings.Join(names, ", "), strings.Join(s.cfg.AvailableModels, ", "), task)
 
 	res, err := orch.Generate(ctx, "You are the orchestrator of a swarm of AI agents.", []llm.Turn{{Role: "user", Text: prompt, Images: images}}, nil)
 	if err != nil {
-		return nil, nil, llm.Usage{}, err
+		return nil, nil, nil, llm.Usage{}, err
 	}
-	plan, assignments, err := parseOrchestration(res.Text)
-	return plan, assignments, res.Usage, err
+	plan, assignments, deps, err := parseOrchestration(res.Text)
+	return plan, assignments, deps, res.Usage, err
 }
 
 func (s *Swarm) buildClient(a Agent, model string) (*llm.Gemini, error) {
@@ -246,7 +335,7 @@ func resolveModel(a Agent, assignments map[string]string, defaultModel string) s
 	return defaultModel
 }
 
-func parseOrchestration(raw string) ([]string, map[string]string, error) {
+func parseOrchestration(raw string) ([]string, map[string]string, map[int][]int, error) {
 	s := strings.TrimSpace(raw)
 	s = strings.TrimPrefix(s, "```json")
 	s = strings.TrimPrefix(s, "```")
@@ -256,21 +345,22 @@ func parseOrchestration(raw string) ([]string, map[string]string, error) {
 	start := strings.Index(s, "{")
 	end := strings.LastIndex(s, "}")
 	if start < 0 || end <= start {
-		return nil, nil, fmt.Errorf("no JSON object found in orchestrator output")
+		return nil, nil, nil, fmt.Errorf("no JSON object found in orchestrator output")
 	}
 
 	var parsed struct {
-		Plan        []string          `json:"plan"`
-		Assignments map[string]string `json:"assignments"`
+		Plan         []string          `json:"plan"`
+		Assignments  map[string]string `json:"assignments"`
+		Dependencies map[int][]int     `json:"dependencies"`
 	}
 	if err := json.Unmarshal([]byte(s[start:end+1]), &parsed); err != nil {
-		return nil, nil, fmt.Errorf("decode orchestrator output: %w", err)
+		return nil, nil, nil, fmt.Errorf("decode orchestrator output: %w", err)
 	}
 	if len(parsed.Plan) == 0 {
-		return nil, nil, fmt.Errorf("empty plan")
+		return nil, nil, nil, fmt.Errorf("empty plan")
 	}
 	if parsed.Assignments == nil {
 		parsed.Assignments = map[string]string{}
 	}
-	return parsed.Plan, parsed.Assignments, nil
+	return parsed.Plan, parsed.Assignments, parsed.Dependencies, nil
 }
