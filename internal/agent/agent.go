@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,12 +20,15 @@ type Config struct {
 	Browser       *browser.Browser // optional; enables the screenshot tool
 	MaxIterations int
 	Log           func(kind, detail string) // optional progress callback
+	OnUsage       func(llm.Usage)           // optional: fired after each model call with its token usage
+	SystemExtra   string                    // optional: appended to the agent's system prompt (e.g. a shared contract)
 }
 
 // Result is what an agent did during a run.
 type Result struct {
 	Summary    string    `json:"summary"`
 	ToolCalls  []string  `json:"tool_calls"`
+	Files      []string  `json:"files"` // workspace-relative paths written/edited
 	Iterations int       `json:"iterations"`
 	Usage      llm.Usage `json:"usage"`
 }
@@ -33,12 +37,15 @@ type Result struct {
 // calls (write files, read files, list files, run commands), and feeds results
 // back until the model finishes with a summary.
 type Agent struct {
-	llm     *llm.Gemini
-	ws      *workspace.Workspace
-	browser *browser.Browser
-	maxIt   int
-	tools   []llm.Tool
-	log     func(kind, detail string)
+	llm         *llm.Gemini
+	ws          *workspace.Workspace
+	browser     *browser.Browser
+	maxIt       int
+	tools       []llm.Tool
+	log         func(kind, detail string)
+	onUsage     func(llm.Usage)
+	systemExtra string
+	files       []string // paths written/edited during the run
 }
 
 func New(cfg Config) *Agent {
@@ -50,7 +57,7 @@ func New(cfg Config) *Agent {
 	if cfg.Browser == nil {
 		tools = withoutTool(tools, "screenshot")
 	}
-	return &Agent{llm: cfg.LLM, ws: cfg.Workspace, browser: cfg.Browser, maxIt: maxIt, tools: tools, log: cfg.Log}
+	return &Agent{llm: cfg.LLM, ws: cfg.Workspace, browser: cfg.Browser, maxIt: maxIt, tools: tools, log: cfg.Log, onUsage: cfg.OnUsage, systemExtra: cfg.SystemExtra}
 }
 
 func (a *Agent) Run(ctx context.Context, task string, images []llm.Image) (Result, error) {
@@ -58,7 +65,12 @@ func (a *Agent) Run(ctx context.Context, task string, images []llm.Image) (Resul
 You have tools to write files, read files, list files, edit files, search the workspace, capture screenshots, and run shell commands to test your work.
 Use tools only when the task actually requires them. For analytical, descriptive, or question-answering tasks (for example describing an attached image or explaining something), answer directly in your response without calling any tools.
 When you do create or change files, actually test them with the run_command tool before finishing.
+All file paths are relative to the workspace root. Never prefix a path with "workspace/" or an absolute directory — write "app/index.html", not "workspace/app/index.html".
 When finished, output a concise summary of what you did and the result.`
+
+	if a.systemExtra != "" {
+		system += "\n\n" + a.systemExtra
+	}
 
 	history := []llm.Turn{{Role: "user", Text: task, Images: images}}
 	var summary strings.Builder
@@ -70,9 +82,15 @@ When finished, output a concise summary of what you did and the result.`
 
 	for iterations < a.maxIt {
 		iterations++
+		if a.log != nil {
+			a.log("model", "generating response")
+		}
 		res, err := a.llm.Generate(ctx, system, history, a.tools)
 		if err != nil {
 			return Result{}, err
+		}
+		if a.onUsage != nil {
+			a.onUsage(res.Usage)
 		}
 		usage.PromptTokens += res.Usage.PromptTokens
 		usage.CompletionTokens += res.Usage.CompletionTokens
@@ -117,7 +135,21 @@ When finished, output a concise summary of what you did and the result.`
 		history = append(history, llm.Turn{Role: "user", ToolResponses: responses})
 	}
 
-	return Result{Summary: summary.String(), ToolCalls: callLog, Iterations: iterations, Usage: usage}, nil
+	return Result{Summary: summary.String(), ToolCalls: callLog, Files: dedupe(a.files), Iterations: iterations, Usage: usage}, nil
+}
+
+// dedupe returns a copy of s with duplicates removed, preserving first-seen order.
+func dedupe(s []string) []string {
+	seen := make(map[string]bool, len(s))
+	out := make([]string, 0, len(s))
+	for _, v := range s {
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 // toolSignature produces a stable string for a set of tool calls so the loop
@@ -141,14 +173,15 @@ func (a *Agent) execute(ctx context.Context, c llm.FunctionCall) llm.FunctionRes
 	}
 	switch c.Name {
 	case "write_file":
-		path, _ := c.Args["path"].(string)
+		path := cleanRelPath(c.Args["path"])
 		content, _ := c.Args["content"].(string)
 		if err := a.ws.WriteFile(path, content); err != nil {
 			return resp(map[string]any{"error": err.Error()})
 		}
+		a.noteFile(path)
 		return resp(map[string]any{"ok": true, "path": path})
 	case "read_file":
-		path, _ := c.Args["path"].(string)
+		path := cleanRelPath(c.Args["path"])
 		data, err := a.ws.ReadFile(path)
 		if err != nil {
 			return resp(map[string]any{"error": err.Error()})
@@ -173,15 +206,20 @@ func (a *Agent) execute(ctx context.Context, c llm.FunctionCall) llm.FunctionRes
 		}
 		return resp(m)
 	case "screenshot":
-		target, _ := c.Args["target"].(string)
+		target := cleanRelPath(c.Args["target"])
 		if target == "" {
-			target, _ = c.Args["url"].(string)
+			target = cleanRelPath(c.Args["url"])
 		}
 		if target == "" {
 			return resp(map[string]any{"error": "screenshot requires a 'target' (URL or file path)"})
 		}
 		if a.browser == nil {
 			return resp(map[string]any{"error": "no browser available"})
+		}
+		// Resolve local (non-URL) targets against the workspace root so agents
+		// can screenshot files they just created.
+		if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+			target = filepath.Join(a.ws.Root(), target)
 		}
 		img, err := a.browser.Screenshot(ctx, target)
 		if err != nil {
@@ -191,6 +229,7 @@ func (a *Agent) execute(ctx context.Context, c llm.FunctionCall) llm.FunctionRes
 		if werr := a.ws.WriteFile(rel, string(img)); werr != nil {
 			return resp(map[string]any{"error": "save screenshot: " + werr.Error()})
 		}
+		a.noteFile(rel)
 		return llm.FunctionResponse{
 			Name:             c.Name,
 			Response:         map[string]any{"ok": true, "path": rel},
@@ -200,7 +239,7 @@ func (a *Agent) execute(ctx context.Context, c llm.FunctionCall) llm.FunctionRes
 			ImageData:        img,
 		}
 	case "edit_file":
-		path, _ := c.Args["path"].(string)
+		path := cleanRelPath(c.Args["path"])
 		oldS, _ := c.Args["old_string"].(string)
 		newS, _ := c.Args["new_string"].(string)
 		if path == "" || oldS == "" {
@@ -210,6 +249,7 @@ func (a *Agent) execute(ctx context.Context, c llm.FunctionCall) llm.FunctionRes
 		if err != nil {
 			return resp(map[string]any{"error": err.Error()})
 		}
+		a.noteFile(path)
 		return resp(map[string]any{"ok": true, "path": path, "replaced": n})
 	case "search_files":
 		query, _ := c.Args["query"].(string)
@@ -224,6 +264,32 @@ func (a *Agent) execute(ctx context.Context, c llm.FunctionCall) llm.FunctionRes
 	default:
 		return resp(map[string]any{"error": "unknown tool: " + c.Name})
 	}
+}
+
+// noteFile records a workspace-relative path that this agent wrote or edited.
+func (a *Agent) noteFile(path string) {
+	if path != "" {
+		a.files = append(a.files, path)
+	}
+}
+
+// cleanRelPath trims common model mistakes from a workspace-relative path: a
+// leading "workspace/" prefix, "./", surrounding whitespace, backslashes and a
+// leading "/". The workspace re-validates the result and rejects escapes.
+func cleanRelPath(v any) string {
+	p, _ := v.(string)
+	p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
+	p = strings.TrimPrefix(p, "./")
+	for strings.HasPrefix(p, "/") {
+		p = strings.TrimPrefix(p, "/")
+	}
+	for strings.HasPrefix(p, "workspace/") {
+		p = strings.TrimPrefix(p, "workspace/")
+	}
+	if p == "workspace" {
+		return ""
+	}
+	return p
 }
 
 func describeTool(c llm.FunctionCall) string {
@@ -260,7 +326,7 @@ func buildTools() []llm.Tool {
 			Parameters: map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
-					"path":    map[string]any{"type": "STRING", "description": "Relative file path inside the workspace"},
+					"path":    map[string]any{"type": "STRING", "description": "Relative file path inside the workspace (do NOT prefix with 'workspace/')"},
 					"content": map[string]any{"type": "STRING", "description": "Full file content"},
 				},
 				"required": []any{"path", "content"},
@@ -272,7 +338,7 @@ func buildTools() []llm.Tool {
 			Parameters: map[string]any{
 				"type":       "OBJECT",
 				"properties": map[string]any{
-					"path": map[string]any{"type": "STRING", "description": "Relative file path inside the workspace"},
+					"path": map[string]any{"type": "STRING", "description": "Relative file path inside the workspace (do NOT prefix with 'workspace/')"},
 				},
 				"required": []any{"path"},
 			},
@@ -302,7 +368,7 @@ func buildTools() []llm.Tool {
 			Parameters: map[string]any{
 				"type":       "OBJECT",
 				"properties": map[string]any{
-					"path":       map[string]any{"type": "STRING", "description": "File path inside the workspace"},
+					"path":       map[string]any{"type": "STRING", "description": "File path inside the workspace (do NOT prefix with 'workspace/')"},
 					"old_string": map[string]any{"type": "STRING", "description": "Exact text to find (must exist in the file)"},
 					"new_string": map[string]any{"type": "STRING", "description": "Replacement text"},
 				},

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"kenosm/internal/transport"
@@ -20,21 +21,27 @@ type Config struct {
 	BaseURL         string
 	APIKey          string
 	Model           string
+	FallbackModels  []string // ordered lighter-model downgrade targets on quota exhaustion
 	Proxy           transport.ProxySpec
+	Transport       http.RoundTripper // optional; overrides the SOCKS5 proxy transport (tests)
 	Timeout         time.Duration
 	MaxRetries      int
 	MaxOutputTokens int
 }
 
 // Gemini is a client for the Gemini generateContent REST API that routes every
-// call through a SOCKS5 proxy and retries transient failures.
+// call through a SOCKS5 proxy and retries transient failures. When a model is
+// out of quota (429 RESOURCE_EXHAUSTED) it transparently downgrades to the next
+// lighter model in FallbackModels, keeping the same API key and proxy.
 type Gemini struct {
 	baseURL         string
 	apiKey          string
-	model           string
 	client          *http.Client
 	maxRetries      int
 	maxOutputTokens int
+	fallbackModels  []string
+	curModel        string
+	mu              sync.Mutex // guards curModel
 }
 
 // APIError is a non-2xx error returned by the Gemini API.
@@ -107,21 +114,17 @@ type Usage struct {
 }
 
 func New(cfg Config) (*Gemini, error) {
-	tr, err := transport.New(cfg.Proxy)
-	if err != nil {
-		return nil, err
+	model := strings.TrimSpace(cfg.Model)
+	if model == "" {
+		return nil, fmt.Errorf("llm: model is required")
 	}
 	base := strings.TrimRight(cfg.BaseURL, "/")
 	if base == "" {
 		base = "https://generativelanguage.googleapis.com/v1beta"
 	}
-	model := cfg.Model
-	if model == "" {
-		model = "gemini-3.8-flash"
-	}
 	timeout := cfg.Timeout
 	if timeout <= 0 {
-		timeout = 180 * time.Second
+		timeout = 120 * time.Second
 	}
 	retries := cfg.MaxRetries
 	if retries <= 0 {
@@ -131,13 +134,34 @@ func New(cfg Config) (*Gemini, error) {
 	if maxTokens <= 0 {
 		maxTokens = 32768
 	}
+
+	var client *http.Client
+	if cfg.Transport != nil {
+		client = &http.Client{Transport: cfg.Transport, Timeout: timeout}
+	} else {
+		tr, err := transport.New(cfg.Proxy)
+		if err != nil {
+			return nil, err
+		}
+		client = &http.Client{Transport: tr, Timeout: timeout}
+	}
+
+	fallbacks := make([]string, 0, len(cfg.FallbackModels))
+	for _, m := range cfg.FallbackModels {
+		m = strings.TrimSpace(m)
+		if m != "" && m != model {
+			fallbacks = append(fallbacks, m)
+		}
+	}
+
 	return &Gemini{
 		baseURL:         base,
 		apiKey:          cfg.APIKey,
-		model:           model,
-		client:          &http.Client{Transport: tr, Timeout: timeout},
+		client:          client,
 		maxRetries:      retries,
 		maxOutputTokens: maxTokens,
+		fallbackModels:  fallbacks,
+		curModel:        model,
 	}, nil
 }
 
@@ -154,8 +178,10 @@ func (g *Gemini) Text(ctx context.Context, system, prompt string) (string, error
 }
 
 // Generate sends a session (history) with optional tools and returns the
-// model's text and any tool calls. It uses non-streaming generateContent and
-// retries transient errors.
+// model's text and any tool calls. It uses non-streaming generateContent,
+// retries transient errors, and on quota exhaustion (429 RESOURCE_EXHAUSTED)
+// downgrades to the next lighter model without dropping the request's API key
+// or proxy.
 func (g *Gemini) Generate(ctx context.Context, system string, history []Turn, tools []Tool) (GenerateResult, error) {
 	req := generateRequest{
 		Contents:         toContents(history),
@@ -169,8 +195,61 @@ func (g *Gemini) Generate(ctx context.Context, system string, history []Turn, to
 	if err != nil {
 		return GenerateResult{}, err
 	}
-	endpoint := fmt.Sprintf("%s/models/%s:generateContent", g.baseURL, g.model)
 
+	models := g.modelChain()
+	var lastErr error
+	for _, m := range models {
+		endpoint := fmt.Sprintf("%s/models/%s:generateContent", g.baseURL, m)
+		res, err := g.generateAt(ctx, endpoint, body)
+		if err == nil {
+			g.stickModel(m)
+			return res, nil
+		}
+		lastErr = err
+		if !isDowngradeTrigger(err) {
+			return GenerateResult{}, err
+		}
+	}
+	return GenerateResult{}, fmt.Errorf("all models exhausted: %w", lastErr)
+}
+
+// modelChain returns the ordered models to try for one generation: the
+// currently-sticky model first, then the lighter fallbacks (deduped).
+func (g *Gemini) modelChain() []string {
+	g.mu.Lock()
+	cur := g.curModel
+	g.mu.Unlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range append([]string{cur}, g.fallbackModels...) {
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	return out
+}
+
+// stickModel remembers the model that last succeeded, so subsequent generations
+// in the same run skip straight to it instead of re-hitting the saturated model.
+func (g *Gemini) stickModel(m string) {
+	g.mu.Lock()
+	g.curModel = m
+	g.mu.Unlock()
+}
+
+// Model returns the model the client is currently using.
+func (g *Gemini) Model() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.curModel
+}
+
+// generateAt retries a single model's endpoint for transient failures. Quota
+// exhaustion (429) is NOT retried here — it bubbles up so Generate can downgrade
+// to a lighter model.
+func (g *Gemini) generateAt(ctx context.Context, endpoint string, body []byte) (GenerateResult, error) {
 	var lastErr error
 	for attempt := 0; attempt < g.maxRetries; attempt++ {
 		if attempt > 0 {
@@ -385,12 +464,25 @@ func isRetryable(err error) bool {
 	var ae *APIError
 	if errors.As(err, &ae) {
 		switch ae.Code {
-		case 429, 500, 502, 503, 504:
+		case 429:
+			// Quota exhaustion: handled by model downgrade, not same-model retries.
+			return false
+		case 500, 502, 503, 504:
 			return true
 		}
 		return false
 	}
 	return true
+}
+
+// isDowngradeTrigger reports whether an error should cause a switch to a
+// lighter model — Gemini 429 RESOURCE_EXHAUSTED (quota) errors.
+func isDowngradeTrigger(err error) bool {
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return ae.StatusCode == 429 || ae.Code == 429 || ae.Status == "RESOURCE_EXHAUSTED"
+	}
+	return false
 }
 
 func backoff(attempt int) time.Duration {

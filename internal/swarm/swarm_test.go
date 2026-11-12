@@ -6,13 +6,16 @@ import (
 )
 
 func TestParseOrchestrationDependencies(t *testing.T) {
-	raw := `{"plan":["a","b","c"],"assignments":{"Gemini A":"m"},"dependencies":{"2":[0,1]}}`
-	plan, assignments, deps, err := parseOrchestration(raw)
+	raw := `{"plan":["a","b","c"],"contract":"use ./x.css", "assignments":{"Gemini A":"m"},"dependencies":{"2":[0,1]}}`
+	plan, contract, assignments, deps, err := parseOrchestration(raw)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	if !reflect.DeepEqual(plan, []string{"a", "b", "c"}) {
 		t.Fatalf("plan = %v", plan)
+	}
+	if contract != "use ./x.css" {
+		t.Fatalf("contract = %q", contract)
 	}
 	if assignments["Gemini A"] != "m" {
 		t.Fatalf("assignments = %v", assignments)
@@ -27,7 +30,7 @@ func TestParseOrchestrationDependencies(t *testing.T) {
 
 func TestParseOrchestrationAbsentDependencies(t *testing.T) {
 	raw := `{"plan":["a","b"]}`
-	_, _, deps, err := parseOrchestration(raw)
+	_, _, _, deps, err := parseOrchestration(raw)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -38,7 +41,7 @@ func TestParseOrchestrationAbsentDependencies(t *testing.T) {
 
 func TestParseOrchestrationEmptyDependencies(t *testing.T) {
 	raw := `{"plan":["a","b"],"dependencies":{}}`
-	_, _, deps, err := parseOrchestration(raw)
+	_, _, _, deps, err := parseOrchestration(raw)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -47,6 +50,21 @@ func TestParseOrchestrationEmptyDependencies(t *testing.T) {
 	}
 	if len(deps) != 0 {
 		t.Fatalf("deps = %v, want empty", deps)
+	}
+}
+
+func TestDowngradeFallbacks(t *testing.T) {
+	available := []string{"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"}
+	got := downgradeFallbacks("gemini-3.5-flash", available)
+	// Lite models must come first (the lightweight downgrade target).
+	if len(got) == 0 || got[0] != "gemini-3.5-flash-lite" {
+		t.Fatalf("got = %v, want lite model first", got)
+	}
+	// The primary must be excluded.
+	for _, m := range got {
+		if m == "gemini-3.5-flash" {
+			t.Fatalf("primary leaked into fallbacks: %v", got)
+		}
 	}
 }
 

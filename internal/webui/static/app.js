@@ -203,6 +203,7 @@ async function runSwarm() {
   setRunning(true);
   $("#run-status").textContent = "Starting...";
   clearConsole();
+  clearLiveFeed();
 
   try {
     const res = await fetch("/api/v1/swarm/run", {
@@ -257,6 +258,7 @@ function streamRun(runId) {
         return;
       }
       renderEvent(e);
+      liveFeed(e);
       if (e.type === "done") {
         $("#run-status").textContent = "Done.";
         finish();
@@ -309,7 +311,9 @@ function renderEvent(e) {
       consoleMsg("done-sub", `${esc(e.detail || "")}`);
       break;
     case "usage":
-      // Token usage is surfaced in the live stats sidebar; no transcript line.
+    case "model":
+      // Token spend and generation activity are shown in the live sidebar,
+      // not the console transcript.
       break;
     case "done":
       consoleMsg("done", "run complete");
@@ -443,24 +447,72 @@ function renderStats(d) {
       : '<p class="hint">No runs yet.</p>';
 }
 
-// Live stats strip in the Swarm sidebar: a compact, always-updating summary.
+// Live stats panel in the Swarm sidebar: a magpie-style, always-updating view
+// of total tokens, per-model / per-agent bars, and a real-time activity feed.
 function renderLiveStats(d) {
   const t = d.totals || {};
-  const models = (d.by_model || []).slice(0, 5);
-  $("#live-stats").innerHTML = `
-    <div class="ls-row"><span>tokens</span><b>${fmt(t.total_tokens)}</b></div>
-    <div class="ls-row"><span>in / out</span><b>${fmt(t.prompt_tokens)} / ${fmt(t.completion_tokens)}</b></div>
-    <div class="ls-row"><span>thinking</span><b>${fmt(t.thought_tokens)}</b></div>
-    <div class="ls-row"><span>calls</span><b>${fmt(t.calls)}</b></div>
-    <div class="ls-row"><span>runs</span><b>${fmt(t.runs)}</b></div>
-    <div class="ls-divider"></div>
-    ${models
-      .map(
-        (m) => `<div class="ls-row model"><span>${esc(m.key)}</span><b>${fmt(m.total_tokens)}</b></div>`
-      )
-      .join("")}
-    ${!models.length ? '<div class="hint">No usage yet.</div>' : ""}
-  `;
+  $("#live-total").textContent = fmt(t.total_tokens);
+  $("#live-split").textContent =
+    "in " + fmt(t.prompt_tokens) + " · out " + fmt(t.completion_tokens) + " · think " + fmt(t.thought_tokens);
+  $("#live-by-model").innerHTML = renderBars(d.by_model);
+  $("#live-by-agent").innerHTML = renderBars(d.by_agent);
+}
+
+function renderBars(rows) {
+  if (!rows || !rows.length) return '<div class="hint">no data</div>';
+  const max = Math.max.apply(null, rows.map((r) => r.total_tokens || 0)) || 1;
+  return rows
+    .map(
+      (r) => `
+    <div class="bar-row">
+      <span class="bar-label" title="${esc(r.key)}">${esc(r.key)}</span>
+      <div class="bar-track"><div class="bar-fill" style="width:${((r.total_tokens / max) * 100).toFixed(1)}%"></div></div>
+      <span class="bar-val">${fmt(r.total_tokens)}</span>
+    </div>`
+    )
+    .join("");
+}
+
+// liveFeed appends real-time activity from the running swarm's SSE stream.
+function liveFeed(e) {
+  let label = "";
+  switch (e.type) {
+    case "usage":
+      label = (e.agent || "") + " +" + fmt(e.usage?.total_tokens || 0) + " tok  (" + (e.model || "") + ")";
+      break;
+    case "model":
+      label = (e.agent || "") + " generating…";
+      break;
+    case "tool":
+      label = (e.agent || "") + " > " + (e.detail || "");
+      break;
+    case "subtask":
+      label = (e.agent || "") + " → " + (e.detail || "");
+      break;
+    case "subtask_done":
+      label = (e.agent || "") + " ✓ " + ((e.detail || "").slice(0, 48) || "done");
+      break;
+    case "done":
+      label = "run complete";
+      break;
+    case "error":
+      label = "error: " + (e.error || e.detail || "");
+      break;
+    default:
+      return;
+  }
+  const el = $("#live-feed");
+  if (!el) return;
+  const line = document.createElement("div");
+  line.className = "feed-line";
+  line.textContent = label;
+  el.prepend(line);
+  while (el.children.length > 40) el.removeChild(el.lastChild);
+}
+
+function clearLiveFeed() {
+  const el = $("#live-feed");
+  if (el) el.innerHTML = "";
 }
 
 function renderGroup(rows) {
@@ -493,24 +545,18 @@ function hideModal() {
   modalConfirmHandler = null;
 }
 
-async function clearContext() {
+function clearContext() {
   showModal(
-    "Clear context for all models?",
-    "This deletes every file in the workspace (all agents' work) so the next run starts from a blank state. This cannot be undone.",
-    async () => {
+    "Clear model context?",
+    "Resets the swarm session: clears the task, attachments and log so the next run starts with a fresh conversation. Workspace files are left untouched.",
+    () => {
       hideModal();
-      try {
-        const res = await fetch("/api/v1/workspace/clear", { method: "POST" });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          $("#run-status").textContent = "Clear failed: " + (data.error || res.status);
-          return;
-        }
-        clearConsole();
-        $("#run-status").textContent = "Context cleared.";
-      } catch (e) {
-        $("#run-status").textContent = "Clear failed: " + e.message;
-      }
+      attached = [];
+      renderAttachments();
+      $("#task").value = "";
+      clearConsole();
+      clearLiveFeed();
+      $("#run-status").textContent = "Context cleared.";
     }
   );
 }

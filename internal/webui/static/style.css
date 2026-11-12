@@ -252,6 +252,21 @@ ol { margin: 0.25rem 0; padding-left: 1.4rem; }
 .ls-row.model span { font-family: ui-monospace, Menlo, monospace; }
 .ls-divider { border-top: 1px solid var(--border); margin: 0.3rem 0; }
 
+/* Magpie-style live usage panel */
+.live-total { font-size: 2rem; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+.live-split { margin-top: 0.2rem; }
+.live-section { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0.5rem 0 0.3rem; }
+
+.live-bars { display: flex; flex-direction: column; gap: 0.2rem; }
+.bar-row { display: grid; grid-template-columns: 72px 1fr 52px; gap: 0.4rem; align-items: center; font-size: 0.75rem; }
+.bar-label { color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, monospace; }
+.bar-track { height: 8px; background: var(--panel); border: 1px solid var(--border); }
+.bar-fill { height: 100%; background: var(--fg); }
+.bar-val { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.live-feed { max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; font-family: ui-monospace, Menlo, monospace; font-size: 0.72rem; }
+.feed-line { border-bottom: 1px dashed var(--border); padding: 2px 0; word-break: break-word; }
+
 /* ---------- Console head + danger + modal ---------- */
 .console-head {
   display: flex;

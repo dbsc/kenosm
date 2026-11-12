@@ -83,13 +83,40 @@ func (w *Workspace) CleanupProcesses() {
 	}
 }
 
-// resolve maps a relative path to an absolute path, refusing to escape root.
+// resolve maps a relative path to an absolute path inside the workspace,
+// refusing to escape root. It normalizes common model mistakes: backslashes,
+// a leading "./" or "/", a leading "<workspace>/" prefix (so agents that
+// over-prefix paths don't create a nested workspace/workspace directory), and
+// absolute paths that already point inside the workspace.
 func (w *Workspace) resolve(rel string) (string, error) {
-	clean := filepath.Clean(rel)
-	if filepath.IsAbs(clean) {
-		clean = strings.TrimPrefix(clean, string(filepath.Separator))
+	rel = strings.TrimSpace(strings.ReplaceAll(rel, "\\", "/"))
+	rootBase := filepath.Base(w.root)
+
+	// If the model passed an absolute path already inside the workspace, make
+	// it relative so it doesn't nest a full path under the root.
+	if abs, err := filepath.Abs(filepath.FromSlash(rel)); err == nil {
+		if r, rerr := filepath.Rel(w.root, abs); rerr == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+			rel = filepath.ToSlash(r)
+		}
 	}
-	abs := filepath.Join(w.root, clean)
+
+	clean := filepath.ToSlash(filepath.Clean(rel))
+	clean = strings.TrimPrefix(clean, "./")
+	for strings.HasPrefix(clean, "/") {
+		clean = strings.TrimPrefix(clean, "/")
+	}
+
+	// Strip a leading "<workspace>/" (the root's own basename) so a path like
+	// "workspace/foo.txt" resolves to "foo.txt" instead of nesting.
+	for strings.HasPrefix(clean, rootBase+"/") || clean == rootBase {
+		if clean == rootBase {
+			clean = ""
+			break
+		}
+		clean = strings.TrimPrefix(clean, rootBase+"/")
+	}
+
+	abs := filepath.Join(w.root, filepath.FromSlash(clean))
 	rel2, err := filepath.Rel(w.root, abs)
 	if err != nil {
 		return "", err
