@@ -290,19 +290,25 @@ func (s *Swarm) plan(ctx context.Context, orch *llm.Gemini, task string, images 
 	for _, a := range s.cfg.Agents {
 		names = append(names, a.Name)
 	}
+	// Ask for at least one subtask per agent so the round-robin actually uses
+	// every configured agent (with few subtasks the later agents stay idle).
+	lo, hi := len(names), 6
+	if lo > hi {
+		hi = lo
+	}
 	prompt := fmt.Sprintf(
 		"You are the orchestrator of a swarm of AI agents.\n"+
 			"Agents: %s\n"+
 			"Available models: %s\n\n"+
 			"Task:\n%s\n\n"+
-			"Break the task into 3-6 concrete subtasks and choose the best model for each agent.\n"+
+			"Break the task into %d-%d concrete subtasks — at least one per agent, so every agent gets work — and choose the best model for each agent.\n"+
 			"Subtasks that are independent (do not read each other's output) should run in parallel.\n"+
 			"Also write a short technical CONTRACT that every subtask must obey: the exact file paths to create, shared identifiers (IDs, CSS class names), and function/API signatures, so all subtasks integrate cleanly and never collide or diverge.\n"+
 			"Return ONLY a JSON object of the form:\n"+
 			"{\"plan\": [\"subtask 0\", \"subtask 1\", ...], \"contract\": \"<shared paths, IDs, classes, signatures>\", \"assignments\": {\"<agent name>\": \"<model>\"}, \"dependencies\": {\"<subtask index>\": [<prerequisite indices>]}}.\n"+
 			"The \"dependencies\" field maps a subtask's index (as a string) to the list of indices it must wait for. Independent subtasks have no entry, so \"dependencies\" may be {}.\n"+
 			"No markdown, no code fences, no extra text.",
-		strings.Join(names, ", "), strings.Join(s.cfg.AvailableModels, ", "), task)
+		strings.Join(names, ", "), strings.Join(s.cfg.AvailableModels, ", "), task, lo, hi)
 
 	res, err := orch.Generate(ctx, "You are the orchestrator of a swarm of AI agents.", []llm.Turn{{Role: "user", Text: prompt, Images: images}}, nil)
 	if err != nil {
