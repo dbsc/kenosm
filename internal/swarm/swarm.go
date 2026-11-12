@@ -141,58 +141,61 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image) (*Resu
 		systemExtra = "Technical contract for this task (shared file paths, IDs, CSS classes and function signatures — follow these exactly):\n" + contract
 	}
 
-	// One slot per agent: each key handles at most one subtask at a time, so
-	// parallelism is bounded by (and spread across) the number of keys.
-	slots := make(map[string]chan struct{}, len(agents))
-	for _, a := range agents {
-		slots[a.Slug] = make(chan struct{}, 1)
-	}
-
 	// done accumulates a running summary of completed waves (which files and
 	// elements were created) so later subtasks reuse instead of duplicating.
 	var done strings.Builder
 
 	for waveIdx, wave := range computeWaves(n, deps) {
-		var wg sync.WaitGroup
+		// Work queue: every agent keeps pulling the next available subtask, so
+		// faster agents pick up more work and the wave finishes as soon as the
+		// slowest subtask is done — dynamic load balancing for any agent count.
+		jobs := make(chan int, len(wave))
 		for _, idx := range wave {
-			a := agents[idx%len(agents)]
-			model := resolveModel(a, assignments, s.cfg.DefaultModel)
+			jobs <- idx
+		}
+		close(jobs)
 
-			files, _ := s.cfg.Workspace.ListFiles()
-			names := make([]string, 0, len(files))
-			for _, f := range files {
-				names = append(names, f.Path)
-			}
-			prompt := fmt.Sprintf("Overall task:\n%s\n\nFull plan:\n- %s\n\nCurrent workspace files: %s\n\nYour subtask (%d of %d):\n%s",
-				task, strings.Join(plan, "\n- "), strings.Join(names, ", "), idx+1, n, plan[idx])
-			if waveIdx > 0 {
-				prompt += "\n\nWork completed in earlier waves (reuse these files and names, do not recreate them):\n" + done.String()
-			}
+		// Snapshot progress once per wave: it doesn't change while the wave
+		// runs, so workers can read it without locking.
+		doneSummary := done.String()
 
-			s.emit(Event{Time: time.Now(), Type: "subtask", Agent: a.Name, Model: model, Detail: fmt.Sprintf("subtask %d/%d: %s", idx+1, n, truncate(plan[idx], 140))})
-
+		var wg sync.WaitGroup
+		for _, a := range agents {
 			wg.Add(1)
-			go func(i int, ag Agent, mdl, prmpt string) {
+			go func(ag Agent) {
 				defer wg.Done()
-				slot := slots[ag.Slug]
-				slot <- struct{}{}
-				defer func() { <-slot }()
+				for idx := range jobs {
+					model := resolveModel(ag, assignments, s.cfg.DefaultModel)
 
-				agRes, usedModel, aerr := s.runWorker(ctx, ag, mdl, prmpt, systemExtra, images)
+					files, _ := s.cfg.Workspace.ListFiles()
+					names := make([]string, 0, len(files))
+					for _, f := range files {
+						names = append(names, f.Path)
+					}
+					prompt := fmt.Sprintf("Overall task:\n%s\n\nFull plan:\n- %s\n\nCurrent workspace files: %s\n\nYour subtask (%d of %d):\n%s",
+						task, strings.Join(plan, "\n- "), strings.Join(names, ", "), idx+1, n, plan[idx])
+					if waveIdx > 0 {
+						prompt += "\n\nWork completed in earlier waves (reuse these files and names, do not recreate them):\n" + doneSummary
+					}
 
-				sr := SubtaskResult{Task: plan[i], Agent: ag.Name, Model: usedModel, Files: agRes.Files}
-				if aerr != nil {
-					sr.Error = aerr.Error()
-					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: "error: " + truncate(aerr.Error(), 240)})
-				} else {
-					sr.Summary = agRes.Summary
-					sr.ToolCalls = agRes.ToolCalls
-					sr.Usage = agRes.Usage
-					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: truncate(agRes.Summary, 240)})
+					s.emit(Event{Time: time.Now(), Type: "subtask", Agent: ag.Name, Model: model, Detail: fmt.Sprintf("subtask %d/%d: %s", idx+1, n, truncate(plan[idx], 140))})
+
+					agRes, usedModel, aerr := s.runWorker(ctx, ag, model, prompt, systemExtra, images)
+
+					sr := SubtaskResult{Task: plan[idx], Agent: ag.Name, Model: usedModel, Files: agRes.Files}
+					if aerr != nil {
+						sr.Error = aerr.Error()
+						s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: "error: " + truncate(aerr.Error(), 240)})
+					} else {
+						sr.Summary = agRes.Summary
+						sr.ToolCalls = agRes.ToolCalls
+						sr.Usage = agRes.Usage
+						s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: truncate(agRes.Summary, 240)})
+					}
+					subResults[idx] = sr
+					subUsage[idx] = UsageRecord{Agent: ag.Name, Model: usedModel, Usage: agRes.Usage}
 				}
-				subResults[i] = sr
-				subUsage[i] = UsageRecord{Agent: ag.Name, Model: usedModel, Usage: agRes.Usage}
-			}(idx, a, model, prompt)
+			}(a)
 		}
 		wg.Wait()
 
@@ -272,6 +275,21 @@ func computeWaves(n int, deps map[int][]int) [][]int {
 	return waves
 }
 
+// subtaskBounds returns the range of subtasks the orchestrator should plan for
+// a given number of agents: at least one per agent (so everyone gets work) and
+// up to twice that (so faster agents can pick up more under work-stealing).
+func subtaskBounds(nAgents int) (lo, hi int) {
+	if nAgents < 1 {
+		nAgents = 1
+	}
+	lo = nAgents
+	hi = 2 * nAgents
+	if hi < 6 {
+		hi = 6
+	}
+	return lo, hi
+}
+
 func (s *Swarm) emit(e Event) {
 	if s.cfg.Emitter != nil {
 		s.cfg.Emitter(e)
@@ -290,18 +308,15 @@ func (s *Swarm) plan(ctx context.Context, orch *llm.Gemini, task string, images 
 	for _, a := range s.cfg.Agents {
 		names = append(names, a.Name)
 	}
-	// Ask for at least one subtask per agent so the round-robin actually uses
-	// every configured agent (with few subtasks the later agents stay idle).
-	lo, hi := len(names), 6
-	if lo > hi {
-		hi = lo
-	}
+	// Ask for enough subtasks to saturate every agent, plus a little slack so
+	// faster agents can pick up more work under the work-stealing scheduler.
+	lo, hi := subtaskBounds(len(names))
 	prompt := fmt.Sprintf(
 		"You are the orchestrator of a swarm of AI agents.\n"+
 			"Agents: %s\n"+
 			"Available models: %s\n\n"+
 			"Task:\n%s\n\n"+
-			"Break the task into %d-%d concrete subtasks — at least one per agent, so every agent gets work — and choose the best model for each agent.\n"+
+			"Break the task into %d-%d concrete subtasks — at least one per agent, and a few extra so faster agents can pick up more — and choose the best model for each agent.\n"+
 			"Subtasks that are independent (do not read each other's output) should run in parallel.\n"+
 			"Also write a short technical CONTRACT that every subtask must obey: the exact file paths to create, shared identifiers (IDs, CSS class names), and function/API signatures, so all subtasks integrate cleanly and never collide or diverge.\n"+
 			"Return ONLY a JSON object of the form:\n"+

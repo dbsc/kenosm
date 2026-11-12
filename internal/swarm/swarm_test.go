@@ -104,3 +104,24 @@ func TestComputeWavesCycle(t *testing.T) {
 		t.Fatalf("waves is empty on cycle, want non-empty")
 	}
 }
+
+func TestSubtaskBounds(t *testing.T) {
+	cases := []struct {
+		agents int
+		lo, hi int
+	}{
+		{0, 1, 6},
+		{1, 1, 6},
+		{2, 2, 6},
+		{3, 3, 6},
+		{5, 5, 10},
+		{10, 10, 20},
+		{15, 15, 30},
+	}
+	for _, c := range cases {
+		lo, hi := subtaskBounds(c.agents)
+		if lo != c.lo || hi != c.hi {
+			t.Errorf("subtaskBounds(%d) = (%d,%d), want (%d,%d)", c.agents, lo, hi, c.lo, c.hi)
+		}
+	}
+}
