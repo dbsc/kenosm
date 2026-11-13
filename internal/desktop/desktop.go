@@ -41,9 +41,10 @@ type Desktop struct {
 	ydSocket    string
 	timeout     time.Duration
 	layoutDelay time.Duration
-	gs          bool       // gsettings available for layout switching
-	mu          sync.Mutex // serializes input that depends on the keyboard layout
-	focused     string     // last window focused via Focus (target for the xdotool fallback)
+	gs          bool           // gsettings available for layout switching
+	mu          sync.Mutex     // serializes input that depends on the keyboard layout
+	focused     string         // last window focused via Focus (target for the xdotool fallback)
+	uinput      *uinputPointer // virtual absolute pointer (nil when unavailable)
 }
 
 // New detects the required tools and returns a Desktop, or an error describing
@@ -78,11 +79,31 @@ func New(cfg Config) (*Desktop, error) {
 			d.ydotool = "" // no ydotoold daemon running
 		}
 	}
+	// Create the virtual absolute pointer (uinput) so the cursor can be moved on
+	// Wayland, where XTEST and REL pointer events are ignored. If it fails (no
+	// /dev/uinput access), mouse tools fall back to xdotool (X11 only).
+	if w, h, err := d.ScreenSize(); err == nil {
+		if p, err := newUinputPointer(w, h); err == nil {
+			d.uinput = p
+		}
+	}
 	return d, nil
 }
 
 // Available reports whether the desktop tools are present.
 func (d *Desktop) Available() bool { return d != nil && d.xdotool != "" }
+
+// Close releases any kernel resources held by the desktop automation layer (the
+// virtual uinput pointer device). It is safe to call on a nil Desktop.
+func (d *Desktop) Close() {
+	if d == nil {
+		return
+	}
+	if d.uinput != nil {
+		d.uinput.close()
+		d.uinput = nil
+	}
+}
 
 func lookup(name string) string {
 	p, err := exec.LookPath(name)
@@ -215,10 +236,13 @@ func (d *Desktop) ScreenSize() (int, int, error) {
 	return w, h, nil
 }
 
-// MouseMove moves the pointer to absolute screen coordinates. NOTE: synthetic
-// pointer movement is blocked by some Wayland compositors (GNOME); this works
-// on X11 sessions.
+// MouseMove moves the pointer to absolute screen coordinates. It uses the
+// virtual absolute pointer (uinput) so it works on Wayland; when that device is
+// unavailable it falls back to xdotool (X11 sessions only).
 func (d *Desktop) MouseMove(x, y int) error {
+	if d.uinput != nil {
+		return d.uinput.move(x, y)
+	}
 	_, err := d.run(d.xdotool, "mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y))
 	return err
 }
@@ -226,6 +250,16 @@ func (d *Desktop) MouseMove(x, y int) error {
 // Click moves the pointer to (x, y) and presses a mouse button: "left",
 // "middle" or "right".
 func (d *Desktop) Click(x, y int, button string) error {
+	if d.uinput != nil {
+		if err := d.uinput.move(x, y); err != nil {
+			return err
+		}
+		code := uinputButton(button)
+		if err := d.uinput.button(code, true); err != nil {
+			return err
+		}
+		return d.uinput.button(code, false)
+	}
 	b := mouseButton(button)
 	if _, err := d.run(d.xdotool, "mousemove", "--sync", strconv.Itoa(x), strconv.Itoa(y)); err != nil {
 		return err

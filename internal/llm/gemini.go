@@ -199,6 +199,11 @@ func (g *Gemini) Generate(ctx context.Context, system string, history []Turn, to
 	models := g.modelChain()
 	var lastErr error
 	for _, m := range models {
+		// Stop early if the whole run was canceled or hit its deadline: cycling
+		// through the remaining models would fail the same way.
+		if ctx.Err() != nil {
+			return GenerateResult{}, ctx.Err()
+		}
 		endpoint := fmt.Sprintf("%s/models/%s:generateContent", g.baseURL, m)
 		res, err := g.generateAt(ctx, endpoint, body)
 		if err == nil {
@@ -206,6 +211,9 @@ func (g *Gemini) Generate(ctx context.Context, system string, history []Turn, to
 			return res, nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			return GenerateResult{}, ctx.Err()
+		}
 		if !isDowngradeTrigger(err) {
 			return GenerateResult{}, err
 		}
@@ -475,14 +483,20 @@ func isRetryable(err error) bool {
 	return true
 }
 
-// isDowngradeTrigger reports whether an error should cause a switch to a
-// lighter model — Gemini 429 RESOURCE_EXHAUSTED (quota) errors.
+// isDowngradeTrigger reports whether a failed generation should switch to the
+// next (lighter) model. Quota exhaustion (429) and transient server errors
+// (5xx) are worth retrying on another model, as are network/timeout failures —
+// a dead or overloaded model must not block the whole run. Permanent client
+// errors (4xx) are not: a lighter model won't fix a malformed request.
 func isDowngradeTrigger(err error) bool {
 	var ae *APIError
 	if errors.As(err, &ae) {
-		return ae.StatusCode == 429 || ae.Code == 429 || ae.Status == "RESOURCE_EXHAUSTED"
+		if ae.StatusCode == 429 || ae.Code == 429 || ae.Status == "RESOURCE_EXHAUSTED" {
+			return true
+		}
+		return ae.StatusCode >= 500
 	}
-	return false
+	return true
 }
 
 func backoff(attempt int) time.Duration {

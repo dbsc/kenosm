@@ -126,6 +126,34 @@ func TestComputeWavesCycle(t *testing.T) {
 	}
 }
 
+func TestParseWaveTasks(t *testing.T) {
+	raw := "```json\n{\"tasks\":{\"0\":\"write index.html\",\"2\":\"test everything\"}}\n```"
+	tasks, err := parseWaveTasks(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if tasks[0] != "write index.html" || tasks[2] != "test everything" || len(tasks) != 2 {
+		t.Fatalf("tasks = %v", tasks)
+	}
+
+	// Bare {"0": "..."} form (models sometimes drop the "tasks" wrapper).
+	bare, err := parseWaveTasks(`{"0":"build app","1":"test it"}`)
+	if err != nil {
+		t.Fatalf("bare parse: %v", err)
+	}
+	if bare[0] != "build app" || bare[1] != "test it" || len(bare) != 2 {
+		t.Fatalf("bare tasks = %v", bare)
+	}
+
+	// Empty string values are dropped.
+	if _, err := parseWaveTasks(`{"tasks":{"0":""}}`); err == nil {
+		t.Fatalf("expected error when all task values are empty")
+	}
+	if _, err := parseWaveTasks("no json here"); err == nil {
+		t.Fatalf("expected error for non-JSON output")
+	}
+}
+
 func TestMaxSubtasks(t *testing.T) {
 	cases := []struct {
 		agents int

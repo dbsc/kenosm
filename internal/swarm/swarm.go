@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -82,12 +83,14 @@ type Result struct {
 	Usage       []UsageRecord        `json:"usage"`
 }
 
-// Run orchestrates the swarm: the orchestrator plans the task and picks a model
-// for each agent, then workers (with tools) build and test files in the shared
-// workspace. Subtasks that the orchestrator marks as independent (via a
-// "dependencies" map) run concurrently across agents, one subtask per agent at
-// a time; dependent subtasks run after their prerequisites finish. Progress is
-// emitted as Events via cfg.Emitter (if set).
+// Run orchestrates the swarm in two stages. First the orchestrator plans the
+// STRUCTURE once: the ordered steps, a shared technical contract, per-agent
+// model assignments and dependency edges between steps. Then the swarm walks
+// that structure wave by wave (steps that don't depend on unfinished work run
+// together). At the start of each wave the orchestrator re-plans the concrete
+// tasks for that wave's steps — tasks are created fresh each time, following the
+// fixed structure but adapted to everything already delivered — and the workers
+// hand their results to the next wave through a shared progress log.
 func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior []llm.Turn) (*Result, error) {
 	agents := s.cfg.Agents
 	if len(agents) == 0 {
@@ -135,11 +138,11 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	res.Assignments = assignments
 	res.Transcript = append(res.Transcript, TranscriptEntry{Agent: "orchestrator", Role: "planner", Text: strings.Join(plan, "\n")})
 
-	s.emit(Event{Time: time.Now(), Type: "plan", Detail: fmt.Sprintf("%d subtasks planned", len(plan))})
+	s.emit(Event{Time: time.Now(), Type: "plan", Detail: fmt.Sprintf("%d steps planned", len(plan))})
 
 	// If the orchestrator gave no dependency info, fall back to fully
-	// sequential (each subtask depends on the previous) — preserves the
-	// original "build on each other's work" behaviour.
+	// sequential (each step depends on the previous) — preserves the original
+	// "build on each other's work" behaviour.
 	if deps == nil {
 		deps = map[int][]int{}
 		for i := 1; i < len(plan); i++ {
@@ -149,88 +152,54 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 
 	n := len(plan)
 	subResults := make([]SubtaskResult, n)
-	subUsage := make([]UsageRecord, n)
 
-	// The shared contract is injected into every subtask's system context so
-	// agents agree on file paths, IDs, CSS classes and signatures up front.
+	// The shared contract is injected into every step's system context so agents
+	// agree on file paths, IDs, CSS classes and signatures up front.
 	systemExtra := ""
 	if contract != "" {
 		systemExtra = "Technical contract for this task (shared file paths, IDs, CSS classes and function signatures — follow these exactly):\n" + contract
 	}
 
-	// done accumulates a running summary of completed waves (which files and
-	// elements were created) so later subtasks reuse instead of duplicating.
+	// done is the swarm's shared handoff log: every finished step appends what it
+	// delivered, and both the re-planner and the later workers read it. This is
+	// how agents pass work to each other.
 	var done strings.Builder
 
-	for waveIdx, wave := range computeWaves(n, deps) {
-		// Work queue: every agent keeps pulling the next available subtask, so
-		// faster agents pick up more work and the wave finishes as soon as the
-		// slowest subtask is done — dynamic load balancing for any agent count.
-		jobs := make(chan int, len(wave))
-		for _, idx := range wave {
-			jobs <- idx
+	for _, wave := range computeWaves(n, deps) {
+		// Re-plan the concrete tasks for this wave's steps, following the fixed
+		// structure but adapted to everything delivered so far. The first wave
+		// has nothing to adapt to yet, so it runs the plan as-is.
+		var tasks map[int]string
+		if done.Len() > 0 {
+			replanned, rusage, rerr := s.replan(ctx, orch, task, plan, contract, wave, done.String())
+			if rerr != nil {
+				s.emit(Event{Time: time.Now(), Type: "subtask", Detail: "re-plan failed, using original step text: " + truncate(rerr.Error(), 160)})
+			} else {
+				tasks = replanned
+				res.Usage = append(res.Usage, UsageRecord{Agent: "orchestrator", Model: orch.Model(), Usage: rusage})
+				s.emit(Event{Time: time.Now(), Type: "usage", Agent: "orchestrator", Model: orch.Model(), Usage: rusage})
+			}
 		}
-		close(jobs)
 
-		// Snapshot progress once per wave: it doesn't change while the wave
-		// runs, so workers can read it without locking.
-		doneSummary := done.String()
-
-		var wg sync.WaitGroup
-		for _, a := range agents {
-			wg.Add(1)
-			go func(ag Agent) {
-				defer wg.Done()
-				for idx := range jobs {
-					model := resolveModel(ag, assignments, s.cfg.DefaultModel)
-
-					files, _ := s.cfg.Workspace.ListFiles()
-					names := make([]string, 0, len(files))
-					for _, f := range files {
-						names = append(names, f.Path)
-					}
-					prompt := fmt.Sprintf("Overall task:\n%s\n\nFull plan:\n- %s\n\nCurrent workspace files: %s\n\nYour subtask (%d of %d):\n%s",
-						task, strings.Join(plan, "\n- "), strings.Join(names, ", "), idx+1, n, plan[idx])
-					if waveIdx > 0 {
-						prompt += "\n\nWork completed in earlier waves (reuse these files and names, do not recreate them):\n" + doneSummary
-					}
-
-					s.emit(Event{Time: time.Now(), Type: "subtask", Agent: ag.Name, Model: model, Detail: fmt.Sprintf("subtask %d/%d: %s", idx+1, n, truncate(plan[idx], 140))})
-
-					agRes, usedModel, aerr := s.runWorker(ctx, ag, model, systemExtra, []llm.Turn{{Role: "user", Text: prompt, Images: images}})
-
-					sr := SubtaskResult{Task: plan[idx], Agent: ag.Name, Model: usedModel, Files: agRes.Files}
-					if aerr != nil {
-						sr.Error = aerr.Error()
-						s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: "error: " + truncate(aerr.Error(), 240)})
-					} else {
-						sr.Summary = agRes.Summary
-						sr.ToolCalls = agRes.ToolCalls
-						sr.Usage = agRes.Usage
-						s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: truncate(agRes.Summary, 240)})
-					}
-					subResults[idx] = sr
-					subUsage[idx] = UsageRecord{Agent: ag.Name, Model: usedModel, Usage: agRes.Usage}
-				}
-			}(a)
+		results, usage := s.runWave(ctx, wave, tasks, plan, task, systemExtra, done.String(), images, assignments)
+		for idx, sr := range results {
+			subResults[idx] = sr
 		}
-		wg.Wait()
+		res.Usage = append(res.Usage, usage...)
 
-		// Summarize this wave for the next one: what each finished subtask
-		// delivered and which files it touched.
+		// Append this wave to the handoff log for the next wave.
 		for _, idx := range wave {
 			sr := subResults[idx]
 			if sr.Error != "" {
-				done.WriteString(fmt.Sprintf("- [%s] subtask %d FAILED: %s\n", sr.Agent, idx+1, truncate(sr.Error, 100)))
+				done.WriteString(fmt.Sprintf("- [%s] step %d FAILED: %s\n", sr.Agent, idx+1, truncate(sr.Error, 100)))
 				continue
 			}
-			done.WriteString(fmt.Sprintf("- [%s] subtask %d (%s): %s (files: %s)\n",
+			done.WriteString(fmt.Sprintf("- [%s] step %d (%s): %s (files: %s)\n",
 				sr.Agent, idx+1, truncate(sr.Task, 60), truncate(sr.Summary, 120), strings.Join(sr.Files, ", ")))
 		}
 	}
 
 	res.Subtasks = subResults
-	res.Usage = append(res.Usage, subUsage...)
 
 	files, _ := s.cfg.Workspace.ListFiles()
 	res.Files = files
@@ -251,6 +220,166 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	}
 
 	return res, nil
+}
+
+// runWave executes one dependency wave. It hands each step's concrete task to
+// the agents over a work-stealing queue (faster agents pick up more steps), so
+// any number of agents — 3 or 50 — stays busy until the wave finishes.
+func (s *Swarm) runWave(ctx context.Context, wave []int, tasks map[int]string, plan []string, task, systemExtra, doneSummary string, images []llm.Image, assignments map[string]string) (map[int]SubtaskResult, []UsageRecord) {
+	jobs := make(chan int, len(wave))
+	for _, idx := range wave {
+		jobs <- idx
+	}
+	close(jobs)
+
+	names := s.fileNames()
+
+	var mu sync.Mutex
+	results := make(map[int]SubtaskResult, len(wave))
+	usage := make([]UsageRecord, 0, len(wave))
+
+	var wg sync.WaitGroup
+	for _, a := range s.cfg.Agents {
+		wg.Add(1)
+		go func(ag Agent) {
+			defer wg.Done()
+			for idx := range jobs {
+				model := resolveModel(ag, assignments, s.cfg.DefaultModel)
+
+				subtask := plan[idx]
+				if t := tasks[idx]; t != "" {
+					subtask = t
+				}
+
+				prompt := fmt.Sprintf("Overall task:\n%s\n\nFull plan (the fixed structure your step belongs to):\n- %s\n\nCurrent workspace files: %s\n\nYour step (%d of %d):\n%s\n\nWhen you finish, your summary is handed to the agents doing the later steps — note exactly what you created and how later steps should reuse it.",
+					task, strings.Join(plan, "\n- "), strings.Join(names, ", "), idx+1, len(plan), subtask)
+				if doneSummary != "" {
+					prompt += "\n\nWork completed in earlier waves (reuse these files and names, do not recreate them):\n" + doneSummary
+				}
+
+				s.emit(Event{Time: time.Now(), Type: "subtask", Agent: ag.Name, Model: model, Detail: fmt.Sprintf("step %d/%d: %s", idx+1, len(plan), truncate(subtask, 140))})
+
+				agRes, usedModel, aerr := s.runWorker(ctx, ag, model, systemExtra, []llm.Turn{{Role: "user", Text: prompt, Images: images}})
+
+				sr := SubtaskResult{Task: subtask, Agent: ag.Name, Model: usedModel, Files: agRes.Files}
+				if aerr != nil {
+					sr.Error = aerr.Error()
+					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: "error: " + truncate(aerr.Error(), 240)})
+				} else {
+					sr.Summary = agRes.Summary
+					sr.ToolCalls = agRes.ToolCalls
+					sr.Usage = agRes.Usage
+					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: truncate(agRes.Summary, 240)})
+				}
+
+				mu.Lock()
+				results[idx] = sr
+				usage = append(usage, UsageRecord{Agent: ag.Name, Model: usedModel, Usage: agRes.Usage})
+				mu.Unlock()
+			}
+		}(a)
+	}
+	wg.Wait()
+	return results, usage
+}
+
+// replan asks the orchestrator to write the concrete tasks for one wave's steps,
+// following the fixed structure (plan + contract) but adapted to what earlier
+// waves already delivered. This is what makes the tasks "created each time"
+// instead of being frozen at plan time.
+func (s *Swarm) replan(ctx context.Context, orch *llm.Gemini, task string, plan []string, contract string, wave []int, done string) (map[int]string, llm.Usage, error) {
+	var steps, example strings.Builder
+	for i, idx := range wave {
+		steps.WriteString(fmt.Sprintf("step %d: %s\n", idx, plan[idx]))
+		if i < len(wave)-1 {
+			example.WriteString(fmt.Sprintf("    \"%d\": \"<concrete instruction for step %d>\",\n", idx, idx))
+		} else {
+			example.WriteString(fmt.Sprintf("    \"%d\": \"<concrete instruction for step %d>\"\n", idx, idx))
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString("You are the orchestrator of a swarm of AI agents.\n")
+	b.WriteString("Overall task:\n" + task + "\n\n")
+	b.WriteString("The plan below is the fixed structure decided up front. Keep it — do not reorder, add or remove steps — but rewrite each requested step as a concrete, self-contained instruction, using everything already completed.\n")
+	b.WriteString("Structure:\n- " + strings.Join(plan, "\n- ") + "\n\n")
+	if contract != "" {
+		b.WriteString("Shared technical contract:\n" + contract + "\n\n")
+	}
+	b.WriteString("Completed so far (reuse these files, names and results; build on them, do not recreate or diverge):\n" + done + "\n\n")
+	if names := s.fileNames(); len(names) > 0 {
+		b.WriteString("Current workspace files: " + strings.Join(names, ", ") + "\n\n")
+	}
+	b.WriteString("Write concrete instructions ONLY for these steps:\n" + steps.String() + "\n")
+	b.WriteString("Return ONLY valid JSON — no markdown, no code fences, no surrounding text — exactly in this shape:\n{\n  \"tasks\": {\n" + example.String() + "  }\n}\n")
+
+	res, err := orch.Generate(ctx, "You are the orchestrator of a swarm of AI agents.", []llm.Turn{{Role: "user", Text: b.String()}}, nil)
+	if err != nil {
+		return nil, llm.Usage{}, err
+	}
+	tasks, err := parseWaveTasks(res.Text)
+	return tasks, res.Usage, err
+}
+
+// parseWaveTasks decodes the re-planner's JSON: step index -> concrete task.
+// It accepts both the wrapped {"tasks": {...}} form and a bare {"0": "..."}
+// object, since models occasionally drop the wrapper.
+func parseWaveTasks(raw string) (map[int]string, error) {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	s = strings.TrimSpace(s)
+
+	start := strings.Index(s, "{")
+	end := strings.LastIndex(s, "}")
+	if start < 0 || end <= start {
+		return nil, fmt.Errorf("no JSON object found in wave-task output")
+	}
+
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(s[start:end+1]), &top); err != nil {
+		return nil, fmt.Errorf("decode wave-task output: %w", err)
+	}
+
+	out := make(map[int]string)
+	for key, raw := range top {
+		if key == "tasks" {
+			var inner map[string]string
+			if json.Unmarshal(raw, &inner) == nil {
+				for k, v := range inner {
+					if idx, err := strconv.Atoi(k); err == nil && idx >= 0 && strings.TrimSpace(v) != "" {
+						out[idx] = v
+					}
+				}
+			}
+			continue
+		}
+		if idx, err := strconv.Atoi(key); err == nil && idx >= 0 {
+			var v string
+			if json.Unmarshal(raw, &v) == nil && strings.TrimSpace(v) != "" {
+				out[idx] = v
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty wave-task output")
+	}
+	return out, nil
+}
+
+// fileNames lists the current workspace file paths, used to tell workers and the
+// re-planner what already exists.
+func (s *Swarm) fileNames() []string {
+	if s.cfg.Workspace == nil {
+		return nil
+	}
+	files, _ := s.cfg.Workspace.ListFiles()
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		names = append(names, f.Path)
+	}
+	return names
 }
 
 // finalize produces the final answer for a swarm run by summarising the

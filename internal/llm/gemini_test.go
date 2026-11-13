@@ -2,11 +2,13 @@ package llm
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // testClient returns a Gemini client wired to an httptest server via its
@@ -121,5 +123,66 @@ func TestGenerateSticksToFallbackOnSubsequentCalls(t *testing.T) {
 func TestNewRequiresModel(t *testing.T) {
 	if _, err := New(Config{BaseURL: "https://example.com", APIKey: "k"}); err == nil {
 		t.Fatal("expected error when model is empty")
+	}
+}
+
+func TestGenerateDowngradesOnTimeout(t *testing.T) {
+	var liteHits atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "gemini-3.5-flash:") {
+			// Simulate a dead model: sleep past the client's timeout so the
+			// request fails with a deadline error instead of an HTTP response.
+			time.Sleep(500 * time.Millisecond)
+			return
+		}
+		liteHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(okBody))
+	}))
+	defer srv.Close()
+
+	g, err := New(Config{
+		BaseURL:        srv.URL,
+		APIKey:         "test-key",
+		Model:          "gemini-3.5-flash",
+		FallbackModels: []string{"gemini-3.5-flash-lite"},
+		Transport:      srv.Client().Transport,
+		Timeout:        200 * time.Millisecond,
+		MaxRetries:     1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	res, err := g.Generate(context.Background(), "sys", []Turn{{Role: "user", Text: "hi"}}, nil)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if res.Text != "hello" {
+		t.Fatalf("text = %q, want hello", res.Text)
+	}
+	if liteHits.Load() != 1 {
+		t.Fatalf("lite hits = %d, want 1 (timeout must downgrade to the next model)", liteHits.Load())
+	}
+}
+
+func TestIsDowngradeTrigger(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{&APIError{StatusCode: 429, Code: 429, Status: "RESOURCE_EXHAUSTED"}, true},
+		{&APIError{StatusCode: 500, Code: 500}, true},
+		{&APIError{StatusCode: 503, Code: 503}, true},
+		{&APIError{StatusCode: 400, Code: 400}, false},
+		{&APIError{StatusCode: 401, Code: 401}, false},
+		{fmt.Errorf("connection refused"), true},
+		{context.DeadlineExceeded, true},
+	}
+	for _, c := range cases {
+		if got := isDowngradeTrigger(c.err); got != c.want {
+			t.Errorf("isDowngradeTrigger(%v) = %v, want %v", c.err, got, c.want)
+		}
 	}
 }

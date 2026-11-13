@@ -82,6 +82,9 @@ func main() {
 		logger.Warn("desktop automation disabled", "err", err)
 		dsk = nil
 	}
+	if dsk != nil {
+		defer dsk.Close()
+	}
 
 	admin := handler.NewAdmin(serviceRepo)
 	gateway := handler.NewGateway(serviceRepo, transportCache, reqLogger)

@@ -20,6 +20,32 @@ func TestMouseButton(t *testing.T) {
 	}
 }
 
+func TestUinputButton(t *testing.T) {
+	cases := map[string]uint16{
+		"":       btnTouch,
+		"left":   btnTouch,
+		"1":      btnTouch,
+		"middle": btnStylus,
+		"2":      btnStylus,
+		"right":  btnStylus2,
+		"3":      btnStylus2,
+		"bogus":  btnTouch,
+	}
+	for in, want := range cases {
+		if got := uinputButton(in); got != want {
+			t.Errorf("uinputButton(%q) = %#x, want %#x", in, got, want)
+		}
+	}
+}
+
+func TestNewUinputPointerInvalidBounds(t *testing.T) {
+	for _, b := range [][2]int{{0, 0}, {-1, 100}, {100, -1}} {
+		if _, err := newUinputPointer(b[0], b[1]); err == nil {
+			t.Errorf("newUinputPointer(%d, %d) = nil error, want error", b[0], b[1])
+		}
+	}
+}
+
 func TestIsDigits(t *testing.T) {
 	for _, s := range []string{"0", "123", "007"} {
 		if !isDigits(s) {
