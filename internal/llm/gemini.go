@@ -339,9 +339,9 @@ type toolDecl struct {
 }
 
 type generateRequest struct {
-	Contents          []content `json:"contents"`
-	SystemInstruction *content  `json:"systemInstruction,omitempty"`
-	GenerationConfig  genConfig `json:"generationConfig,omitempty"`
+	Contents          []content  `json:"contents"`
+	SystemInstruction *content   `json:"systemInstruction,omitempty"`
+	GenerationConfig  genConfig  `json:"generationConfig,omitempty"`
 	Tools             []toolDecl `json:"tools,omitempty"`
 }
 

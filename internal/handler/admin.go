@@ -54,18 +54,18 @@ func (a *Admin) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	svc := model.Service{
-		Slug:          normalizeSlug(deref(in.Slug)),
-		Name:          deref(in.Name),
-		UpstreamURL:   deref(in.UpstreamURL),
+		Slug:           normalizeSlug(deref(in.Slug)),
+		Name:           deref(in.Name),
+		UpstreamURL:    deref(in.UpstreamURL),
 		UpstreamAPIKey: deref(in.UpstreamAPIKey),
-		AuthHeader:    defaultString(in.AuthHeader, "Authorization"),
-		AuthScheme:    defaultString(in.AuthScheme, "Bearer"),
-		ProxyHost:     deref(in.ProxyHost),
-		ProxyPort:     derefInt(in.ProxyPort),
-		ProxyUsername: deref(in.ProxyUsername),
-		ProxyPassword: deref(in.ProxyPassword),
-		Model:         deref(in.Model),
-		Enabled:       defaultBool(in.Enabled, true),
+		AuthHeader:     defaultString(in.AuthHeader, "Authorization"),
+		AuthScheme:     defaultString(in.AuthScheme, "Bearer"),
+		ProxyHost:      deref(in.ProxyHost),
+		ProxyPort:      derefInt(in.ProxyPort),
+		ProxyUsername:  deref(in.ProxyUsername),
+		ProxyPassword:  deref(in.ProxyPassword),
+		Model:          deref(in.Model),
+		Enabled:        defaultBool(in.Enabled, true),
 	}
 
 	if err := validateService(&svc); err != nil {

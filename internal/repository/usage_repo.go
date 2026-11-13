@@ -18,14 +18,14 @@ func NewUsageRepo(pool *pgxpool.Pool) *UsageRepo {
 // UsageEntry is one recorded usage line: an agent (API key) + model used for a
 // given run/task.
 type UsageEntry struct {
-	RunID           string
-	Task            string
-	Agent           string
-	Model           string
-	PromptTokens    int
+	RunID            string
+	Task             string
+	Agent            string
+	Model            string
+	PromptTokens     int
 	CompletionTokens int
-	ThoughtTokens   int
-	TotalTokens     int
+	ThoughtTokens    int
+	TotalTokens      int
 }
 
 func (r *UsageRepo) Insert(ctx context.Context, u UsageEntry) error {

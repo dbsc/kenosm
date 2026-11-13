@@ -9,15 +9,15 @@ import (
 
 // Config holds runtime configuration, loaded from environment variables.
 type Config struct {
-	Addr             string
-	DatabaseURL      string
-	SecretKey        string
-	GeminiModel      string
+	Addr              string
+	DatabaseURL       string
+	SecretKey         string
+	GeminiModel       string
 	OrchestratorModel string
-	AvailableModels  []string
-	WorkspaceDir     string
-	CommandTimeout   time.Duration
-	ShutdownTimeout  time.Duration
+	AvailableModels   []string
+	WorkspaceDir      string
+	CommandTimeout    time.Duration
+	ShutdownTimeout   time.Duration
 }
 
 // Load reads configuration from the environment, applying development defaults

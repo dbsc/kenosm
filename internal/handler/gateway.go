@@ -25,7 +25,7 @@ import (
 type ctxKey int
 
 const (
-	serviceCtxKey   ctxKey = iota
+	serviceCtxKey ctxKey = iota
 	remainingPathKey
 	startTimeKey
 )
