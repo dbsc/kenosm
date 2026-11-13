@@ -56,6 +56,7 @@ func main() {
 	serviceRepo := repository.NewServiceRepo(pool, cipher)
 	logRepo := repository.NewLogRepo(pool)
 	usageRepo := repository.NewUsageRepo(pool)
+	chatRepo := repository.NewChatRepo(pool)
 
 	transportCache := transport.NewCache()
 	reqLogger := logging.New(ctx, logRepo, logger, 1024)
@@ -74,7 +75,7 @@ func main() {
 
 	admin := handler.NewAdmin(serviceRepo)
 	gateway := handler.NewGateway(serviceRepo, transportCache, reqLogger)
-	swarmHandler := handler.NewSwarm(serviceRepo, usageRepo, cfg.OrchestratorModel, cfg.GeminiModel, cfg.AvailableModels, ws, br)
+	swarmHandler := handler.NewSwarm(serviceRepo, usageRepo, chatRepo, cfg.OrchestratorModel, cfg.GeminiModel, cfg.AvailableModels, ws, br)
 	wsHandler := handler.NewWorkspace(ws)
 	statsHandler := handler.NewStats(usageRepo)
 

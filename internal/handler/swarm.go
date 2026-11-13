@@ -32,9 +32,10 @@ type Swarm struct {
 	ws                *workspace.Workspace
 	browser           *browser.Browser
 	registry          *runRegistry
+	chats             *repository.ChatRepo
 }
 
-func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser) *Swarm {
+func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser) *Swarm {
 	return &Swarm{
 		repo:              repo,
 		usage:             usage,
@@ -44,11 +45,13 @@ func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, orchest
 		ws:                ws,
 		browser:           br,
 		registry:          newRunRegistry(),
+		chats:             chats,
 	}
 }
 
-// Run starts a swarm run in the background and returns its run ID immediately.
-// Progress is then streamed via Events over Server-Sent Events.
+// Run starts a background run (defaulting to swarm mode) and returns its run ID
+// immediately. The chat endpoints are the primary interface now; this remains
+// for compatibility and direct API use.
 func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Task   string `json:"task"`
@@ -56,6 +59,7 @@ func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 			MimeType string `json:"mime_type"`
 			Data     string `json:"data"` // base64-encoded bytes, optionally a full data URL
 		} `json:"images"`
+		Mode string `json:"mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -72,32 +76,53 @@ func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	services, err := h.repo.ListWithSecrets(r.Context())
+	agents, err := h.loadAgents(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if len(services) == 0 {
-		writeError(w, http.StatusConflict, "no agents configured: register at least one service first")
+		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 
+	mode := in.Mode
+	if mode != modeSingle && mode != modeSwarm {
+		mode = modeSwarm
+	}
+	runID, _ := h.runTurn(agents, in.Task, images, nil, mode, nil, nil)
+
+	writeJSON(w, http.StatusAccepted, map[string]string{"run_id": runID})
+}
+
+// loadAgents returns the swarm agents for the enabled services, or an error if
+// none are configured.
+func (h *Swarm) loadAgents(ctx context.Context) ([]swarm.Agent, error) {
+	services, err := h.repo.ListWithSecrets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(services) == 0 {
+		return nil, fmt.Errorf("no agents configured: register at least one service first")
+	}
+	return swarm.AgentsFromServices(services), nil
+}
+
+// runTurn starts a single- or swarm-mode turn in the background and returns its
+// run ID. The emitter records every event to the live stream and persists each
+// usage event to the DB immediately, so stats update while the run executes.
+// onDone, if set, is called with the finished result right before the terminal
+// "done" event is emitted (used to persist the assistant message into a chat).
+func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, prior []llm.Turn, mode string, onDone func(*swarm.Result), onError func(string)) (string, *runState) {
 	runID, state := h.registry.create()
 	state.add(swarm.Event{Time: time.Now(), Type: "start", Detail: "run started"})
 
-	// The emitter records every event to the live stream AND persists each usage
-	// event to the DB immediately, so the stats panel updates while the run is
-	// still executing (not just after it finishes).
-	task := truncateText(in.Task, 200)
+	label := truncateText(task, 200)
 	emitter := func(e swarm.Event) {
 		state.add(e)
 		if e.Type == "usage" {
-			h.insertUsage(runID, task, e)
+			h.insertUsage(runID, label, e)
 		}
 	}
 
 	sw := swarm.New(swarm.Config{
-		Agents:            swarm.AgentsFromServices(services),
+		Agents:            agents,
 		OrchestratorModel: h.orchestratorModel,
 		DefaultModel:      h.defaultModel,
 		AvailableModels:   h.availableModels,
@@ -106,9 +131,8 @@ func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 		Emitter:           emitter,
 	})
 
-	// Use a fresh context so the run survives the request returning, and wire
-	// its cancel into the registry synchronously so Stop works even if called
-	// immediately after the run starts.
+	// A fresh context lets the run outlive the HTTP request; its cancel is wired
+	// into the registry synchronously so Stop works even if called immediately.
 	ctx, cancel := context.WithCancel(context.Background())
 	state.setCancel(cancel)
 
@@ -117,18 +141,33 @@ func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 		runCtx, cancelRun := context.WithTimeout(ctx, runTimeout)
 		defer cancelRun()
 
-		result, err := sw.Run(runCtx, in.Task, images)
+		var result *swarm.Result
+		var err error
+		switch mode {
+		case modeSingle:
+			history := append(append([]llm.Turn{}, prior...), llm.Turn{Role: "user", Text: task, Images: images})
+			result, err = sw.RunSingle(runCtx, agents[0], history)
+		default:
+			result, err = sw.Run(runCtx, task, images, prior)
+		}
 		if err != nil {
 			if state.isStopped() {
 				return // the Stop handler already emitted a terminal "stopped" event
 			}
-			state.add(swarm.Event{Time: time.Now(), Type: "error", Error: err.Error()})
+			msg := err.Error()
+			if onError != nil {
+				onError(msg)
+			}
+			state.add(swarm.Event{Time: time.Now(), Type: "error", Error: msg})
 			return
+		}
+		if onDone != nil {
+			onDone(result)
 		}
 		state.add(swarm.Event{Time: time.Now(), Type: "done", Result: result})
 	}()
 
-	writeJSON(w, http.StatusAccepted, map[string]string{"run_id": runID})
+	return runID, state
 }
 
 // Stop cancels a running swarm run. The run's context is canceled, the agent

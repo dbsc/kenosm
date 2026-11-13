@@ -187,7 +187,10 @@ function renderAttachments() {
     .join("");
 }
 
-// ---------- Swarm console ----------
+// ---------- Chat ----------
+let chats = [];
+let currentChatId = null;
+let currentMode = "single";
 let currentRunId = null;
 let currentES = null;
 
@@ -197,32 +200,147 @@ function setRunning(running) {
   if (!running) currentRunId = null;
 }
 
-async function runSwarm() {
-  const task = $("#task").value.trim();
-  if (!task) return;
-  setRunning(true);
-  $("#run-status").textContent = "Starting...";
-  clearConsole();
+function setMode(mode) {
+  currentMode = mode;
+  $("#btn-mode-single").classList.toggle("active", mode === "single");
+  $("#btn-mode-swarm").classList.toggle("active", mode === "swarm");
+}
+
+// ---- chat list ----
+async function loadChats() {
+  const res = await fetch("/api/v1/chats");
+  const data = await res.json();
+  chats = data.chats || [];
+  renderChatTabs();
+  if (!chats.length) {
+    await newChat();
+  } else if (!currentChatId || !chats.find((c) => c.id === currentChatId)) {
+    await selectChat(chats[0].id);
+  }
+}
+
+async function newChat() {
+  const res = await fetch("/api/v1/chats", { method: "POST" });
+  const c = await res.json();
+  chats.push(c);
+  currentChatId = c.id;
+  setMode(c.mode || "single");
+  renderChatTabs();
+  renderMessages([]);
+}
+
+function renderChatTabs() {
+  const el = $("#chat-tabs");
+  el.innerHTML = chats
+    .map(
+      (c) => `
+      <div class="chat-tab ${c.id === currentChatId ? "active" : ""}" data-id="${esc(c.id)}">
+        <span class="chat-tab-title">${esc(c.title || "New chat")}</span>
+        <button class="chat-tab-x" data-id="${esc(c.id)}" title="Delete chat">&times;</button>
+      </div>`
+    )
+    .join("");
+  el.querySelectorAll(".chat-tab").forEach((tab) => {
+    tab.addEventListener("click", (ev) => {
+      if (ev.target.classList.contains("chat-tab-x")) {
+        deleteChat(tab.dataset.id);
+        return;
+      }
+      selectChat(tab.dataset.id);
+    });
+  });
+}
+
+async function selectChat(id) {
+  const res = await fetch("/api/v1/chats/" + encodeURIComponent(id));
+  if (!res.ok) return;
+  const c = await res.json();
+  currentChatId = c.id;
+  setMode(c.mode || "single");
+  renderChatTabs();
+  renderMessages(c.messages || []);
   clearLiveFeed();
+}
+
+async function deleteChat(id) {
+  if (!confirm("Delete this chat?")) return;
+  await fetch("/api/v1/chats/" + encodeURIComponent(id), { method: "DELETE" });
+  chats = chats.filter((c) => c.id !== id);
+  if (currentChatId === id) currentChatId = null;
+  renderChatTabs();
+  if (!chats.length) await newChat();
+  else await selectChat(chats[0].id);
+}
+
+// ---- messages ----
+function renderMessages(messages) {
+  const c = $("#console-scroll");
+  c.innerHTML = "";
+  if (!messages.length) {
+    c.innerHTML = '<div class="msg system" id="console-empty">New chat. Write a message below.</div>';
+    return;
+  }
+  for (const m of messages) addMessageBubble(m.role, m.text);
+}
+
+function addMessageBubble(role, text) {
+  const c = $("#console-scroll");
+  const empty = $("#console-empty");
+  if (empty) empty.remove();
+  const div = document.createElement("div");
+  div.className = "bubble " + (role === "user" ? "bubble-user" : "bubble-assistant");
+  div.textContent = text;
+  c.appendChild(div);
+  c.scrollTop = c.scrollHeight;
+  return div;
+}
+
+function addThinkingBubble() {
+  const c = $("#console-scroll");
+  const empty = $("#console-empty");
+  if (empty) empty.remove();
+  const div = document.createElement("div");
+  div.className = "bubble bubble-assistant bubble-thinking";
+  div.textContent = "…";
+  c.appendChild(div);
+  c.scrollTop = c.scrollHeight;
+  return div;
+}
+
+// ---- send ----
+async function sendMessage() {
+  const text = $("#task").value.trim();
+  if (!text) return;
+  if (!currentChatId) await newChat();
+  $("#task").value = "";
+
+  addMessageBubble("user", text);
+  const images = attached.map((a) => ({ mime_type: a.mime_type, data: a.data }));
+  attached = [];
+  renderAttachments();
+
+  setRunning(true);
+  $("#run-status").textContent = "Thinking…";
+  const thinking = addThinkingBubble();
 
   try {
-    const res = await fetch("/api/v1/swarm/run", {
+    const res = await fetch("/api/v1/chats/" + encodeURIComponent(currentChatId) + "/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        task,
-        images: attached.map((a) => ({ mime_type: a.mime_type, data: a.data })),
-      }),
+      body: JSON.stringify({ text, mode: currentMode, images }),
     });
     const data = await res.json();
     if (!res.ok) {
+      thinking.textContent = "Error: " + (data.error || res.status);
+      thinking.classList.add("bubble-error");
       $("#run-status").textContent = "Error: " + (data.error || res.status);
-      setRunning(false);
       return;
     }
     currentRunId = data.run_id;
-    await streamRun(data.run_id);
+    await streamChatRun(data.run_id, thinking);
   } catch (e) {
+    thinking.textContent = "Error: " + e.message;
+    thinking.classList.add("bubble-error");
     $("#run-status").textContent = "Error: " + e.message;
   } finally {
     setRunning(false);
@@ -231,17 +349,13 @@ async function runSwarm() {
 
 async function stopRun() {
   if (!currentRunId) return;
-  $("#run-status").textContent = "Stopping...";
+  $("#run-status").textContent = "Stopping…";
   try {
     await fetch("/api/v1/swarm/run/" + currentRunId + "/stop", { method: "POST" });
   } catch (e) {}
 }
 
-function clearConsole() {
-  $("#console-scroll").innerHTML = "";
-}
-
-function streamRun(runId) {
+function streamChatRun(runId, thinking) {
   return new Promise((resolve) => {
     const es = new EventSource("/api/v1/swarm/run/" + runId + "/events");
     currentES = es;
@@ -257,15 +371,20 @@ function streamRun(runId) {
       } catch {
         return;
       }
-      renderEvent(e);
       liveFeed(e);
       if (e.type === "done") {
+        thinking.textContent = e.result?.final || "";
+        thinking.classList.remove("bubble-thinking");
         $("#run-status").textContent = "Done.";
         finish();
       } else if (e.type === "error") {
+        thinking.textContent = "Error: " + (e.error || "unknown");
+        thinking.classList.add("bubble-error");
         $("#run-status").textContent = "Error: " + (e.error || "unknown");
         finish();
       } else if (e.type === "stopped") {
+        thinking.textContent = "Stopped.";
+        thinking.classList.add("bubble-error");
         $("#run-status").textContent = "Stopped.";
         finish();
       }
@@ -275,91 +394,6 @@ function streamRun(runId) {
       finish();
     };
   });
-}
-
-function consoleMsg(cls, html) {
-  const c = $("#console-scroll");
-  const div = document.createElement("div");
-  div.className = "msg " + cls;
-  div.innerHTML = html;
-  c.appendChild(div);
-  c.scrollTop = c.scrollHeight;
-  return div;
-}
-
-function renderEvent(e) {
-  switch (e.type) {
-    case "start":
-      consoleMsg("system", "run started");
-      break;
-    case "planning":
-      consoleMsg("thinking", `<span class="who">orchestrator</span> planning…`);
-      break;
-    case "plan":
-      consoleMsg("info", `<span class="who">plan</span> ${esc(e.detail || "")}`);
-      break;
-    case "subtask":
-      consoleMsg(
-        "subtask",
-        `<span class="who">${esc(e.agent || "")}</span><span class="model">${esc(e.model || "")}</span> ${esc(e.detail || "")}`
-      );
-      break;
-    case "tool":
-      consoleMsg("tool", `<span class="toolmark">&gt;</span> ${esc(e.detail || "")}`);
-      break;
-    case "subtask_done":
-      consoleMsg("done-sub", `${esc(e.detail || "")}`);
-      break;
-    case "usage":
-    case "model":
-      // Token spend and generation activity are shown in the live sidebar,
-      // not the console transcript.
-      break;
-    case "done":
-      consoleMsg("done", "run complete");
-      if (e.result) renderResult(e.result);
-      break;
-    case "stopped":
-      consoleMsg("error", "run stopped by user");
-      break;
-    case "error":
-      consoleMsg("error", "error: " + esc(e.error || e.detail || ""));
-      break;
-    default:
-      consoleMsg("", esc(e.type) + ": " + esc(e.detail || e.error || ""));
-  }
-}
-
-function renderResult(d) {
-  const c = $("#console-scroll");
-  const box = document.createElement("div");
-  box.className = "msg result";
-
-  const plan = (d.plan || []).map((p) => `<li>${esc(p)}</li>`).join("");
-  const subtasks = (d.subtasks || [])
-    .map(
-      (s) => `
-      <div class="subtask">
-        <div class="head"><b>${esc(s.agent)}</b><span>${esc(s.model)}</span><span>${(s.tool_calls || []).join(", ")}</span>${s.error ? "<span>error: " + esc(s.error) + "</span>" : ""}</div>
-        <div class="summary">${esc(s.summary)}</div>
-      </div>`
-    )
-    .join("");
-  const files = (d.files || [])
-    .map(
-      (f) => `<div class="file-row"><span>${esc(f.path)}</span><span class="hint">${f.size} bytes</span><button class="btn small ghost" onclick="viewFile('${esc(f.path)}')">View</button></div>`
-    )
-    .join("");
-
-  box.innerHTML = `
-    <div class="result-head">Result</div>
-    ${plan ? `<div class="result-sec"><b>Plan</b><ol>${plan}</ol></div>` : ""}
-    ${subtasks ? `<div class="result-sec"><b>Subtasks</b>${subtasks}</div>` : ""}
-    ${files ? `<div class="result-sec"><b>Workspace files</b>${files}</div>` : ""}
-    ${d.final ? `<div class="result-sec"><b>Summary</b><pre>${esc(d.final)}</pre></div>` : ""}
-  `;
-  c.appendChild(box);
-  c.scrollTop = c.scrollHeight;
 }
 
 // ---------- Files ----------
@@ -492,6 +526,9 @@ function liveFeed(e) {
     case "subtask_done":
       label = (e.agent || "") + " ✓ " + ((e.detail || "").slice(0, 48) || "done");
       break;
+    case "direct":
+      label = (e.agent || "") + " → " + (e.detail || "");
+      break;
     case "done":
       label = "run complete";
       break;
@@ -530,7 +567,7 @@ function renderGroup(rows) {
     .join("");
 }
 
-// ---------- Modal + clear context ----------
+// ---------- Modal ----------
 let modalConfirmHandler = null;
 
 function showModal(title, msg, onConfirm) {
@@ -545,30 +582,15 @@ function hideModal() {
   modalConfirmHandler = null;
 }
 
-function clearContext() {
-  showModal(
-    "Clear model context?",
-    "Resets the swarm session: clears the task, attachments and log so the next run starts with a fresh conversation. Workspace files are left untouched.",
-    () => {
-      hideModal();
-      attached = [];
-      renderAttachments();
-      $("#task").value = "";
-      clearConsole();
-      clearLiveFeed();
-      $("#run-status").textContent = "Context cleared.";
-    }
-  );
-}
-
 // ---------- Init ----------
 $("#btn-new-agent").addEventListener("click", openNewAgent);
 $("#btn-save-agent").addEventListener("click", saveAgent);
 $("#btn-cancel-agent").addEventListener("click", () => $("#agent-form").classList.add("hidden"));
-$("#btn-run").addEventListener("click", runSwarm);
+$("#btn-run").addEventListener("click", sendMessage);
 $("#btn-stop").addEventListener("click", stopRun);
-$("#btn-clear-console").addEventListener("click", clearConsole);
-$("#btn-clear-context").addEventListener("click", clearContext);
+$("#btn-new-chat").addEventListener("click", newChat);
+$("#btn-mode-single").addEventListener("click", () => setMode("single"));
+$("#btn-mode-swarm").addEventListener("click", () => setMode("swarm"));
 $("#modal-cancel").addEventListener("click", hideModal);
 $("#modal-confirm").addEventListener("click", () => {
   if (modalConfirmHandler) modalConfirmHandler();
@@ -580,6 +602,7 @@ $("#modal").addEventListener("click", (e) => {
 loadAgents();
 loadModels();
 loadStats();
+loadChats();
 
 // Poll stats every 2s so the live usage panel updates in parallel with any run.
 setInterval(async () => {

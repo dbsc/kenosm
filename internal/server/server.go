@@ -40,6 +40,13 @@ func New(admin *handler.Admin, gateway *handler.Gateway, swarm *handler.Swarm, w
 	r.Post("/api/v1/swarm/run/{runID}/stop", swarm.Stop)
 	r.Get("/api/v1/models", swarm.Models)
 
+	// Chat sessions (persistent conversations, single-agent or swarm turns).
+	r.Get("/api/v1/chats", swarm.ListChats)
+	r.Post("/api/v1/chats", swarm.CreateChat)
+	r.Get("/api/v1/chats/{id}", swarm.GetChat)
+	r.Delete("/api/v1/chats/{id}", swarm.DeleteChat)
+	r.Post("/api/v1/chats/{id}/messages", swarm.SendMessage)
+
 	// Workspace.
 	r.Get("/api/v1/workspace/files", ws.List)
 	r.Get("/api/v1/workspace/files/*", ws.Read)

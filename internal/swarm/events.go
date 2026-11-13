@@ -11,7 +11,7 @@ import (
 // the agents work in real time.
 type Event struct {
 	Time   time.Time `json:"time"`
-	Type   string    `json:"type"` // planning, plan, subtask, model, tool, subtask_done, usage, done, stopped, error
+	Type   string    `json:"type"` // start, planning, plan, direct, subtask, model, tool, subtask_done, usage, done, stopped, error
 	Agent  string    `json:"agent,omitempty"`
 	Model  string    `json:"model,omitempty"`
 	Detail string    `json:"detail,omitempty"`

@@ -7,49 +7,70 @@ import (
 
 func TestParseOrchestrationDependencies(t *testing.T) {
 	raw := `{"plan":["a","b","c"],"contract":"use ./x.css", "assignments":{"Gemini A":"m"},"dependencies":{"2":[0,1]}}`
-	plan, contract, assignments, deps, err := parseOrchestration(raw)
+	o, err := parseOrchestration(raw)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if !reflect.DeepEqual(plan, []string{"a", "b", "c"}) {
-		t.Fatalf("plan = %v", plan)
+	if o.Direct {
+		t.Fatalf("direct = true, want false")
 	}
-	if contract != "use ./x.css" {
-		t.Fatalf("contract = %q", contract)
+	if !reflect.DeepEqual(o.Plan, []string{"a", "b", "c"}) {
+		t.Fatalf("plan = %v", o.Plan)
 	}
-	if assignments["Gemini A"] != "m" {
-		t.Fatalf("assignments = %v", assignments)
+	if o.Contract != "use ./x.css" {
+		t.Fatalf("contract = %q", o.Contract)
 	}
-	if deps == nil {
+	if o.Assignments["Gemini A"] != "m" {
+		t.Fatalf("assignments = %v", o.Assignments)
+	}
+	if o.Dependencies == nil {
 		t.Fatalf("deps is nil, want non-nil with {2:[0 1]}")
 	}
-	if !reflect.DeepEqual(deps[2], []int{0, 1}) {
-		t.Fatalf("deps[2] = %v", deps[2])
+	if !reflect.DeepEqual(o.Dependencies[2], []int{0, 1}) {
+		t.Fatalf("deps[2] = %v", o.Dependencies[2])
+	}
+}
+
+func TestParseOrchestrationDirect(t *testing.T) {
+	raw := `{"direct": true, "answer": "Привет! Чем помочь?"}`
+	o, err := parseOrchestration(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !o.Direct {
+		t.Fatalf("direct = false, want true")
+	}
+	if o.Answer != "Привет! Чем помочь?" {
+		t.Fatalf("answer = %q", o.Answer)
+	}
+}
+
+func TestParseOrchestrationDirectEmpty(t *testing.T) {
+	if _, err := parseOrchestration(`{"direct": true, "answer": ""}`); err == nil {
+		t.Fatalf("expected error for empty direct answer")
 	}
 }
 
 func TestParseOrchestrationAbsentDependencies(t *testing.T) {
-	raw := `{"plan":["a","b"]}`
-	_, _, _, deps, err := parseOrchestration(raw)
+	o, err := parseOrchestration(`{"plan":["a","b"]}`)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if deps != nil {
-		t.Fatalf("deps = %v, want nil for absent field", deps)
+	if o.Dependencies != nil {
+		t.Fatalf("deps = %v, want nil for absent field", o.Dependencies)
 	}
 }
 
 func TestParseOrchestrationEmptyDependencies(t *testing.T) {
-	raw := `{"plan":["a","b"],"dependencies":{}}`
-	_, _, _, deps, err := parseOrchestration(raw)
+	o, err := parseOrchestration(`{"plan":["a","b"],"dependencies":{}}`)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if deps == nil {
+	if o.Dependencies == nil {
 		t.Fatalf("deps is nil, want empty non-nil map for {}")
 	}
-	if len(deps) != 0 {
-		t.Fatalf("deps = %v, want empty", deps)
+	if len(o.Dependencies) != 0 {
+		t.Fatalf("deps = %v, want empty", o.Dependencies)
 	}
 }
 
@@ -105,23 +126,22 @@ func TestComputeWavesCycle(t *testing.T) {
 	}
 }
 
-func TestSubtaskBounds(t *testing.T) {
+func TestMaxSubtasks(t *testing.T) {
 	cases := []struct {
 		agents int
-		lo, hi int
+		want   int
 	}{
-		{0, 1, 6},
-		{1, 1, 6},
-		{2, 2, 6},
-		{3, 3, 6},
-		{5, 5, 10},
-		{10, 10, 20},
-		{15, 15, 30},
+		{0, 4},
+		{1, 4},
+		{2, 4},
+		{3, 6},
+		{5, 10},
+		{10, 20},
+		{15, 30},
 	}
 	for _, c := range cases {
-		lo, hi := subtaskBounds(c.agents)
-		if lo != c.lo || hi != c.hi {
-			t.Errorf("subtaskBounds(%d) = (%d,%d), want (%d,%d)", c.agents, lo, hi, c.lo, c.hi)
+		if got := maxSubtasks(c.agents); got != c.want {
+			t.Errorf("maxSubtasks(%d) = %d, want %d", c.agents, got, c.want)
 		}
 	}
 }

@@ -61,6 +61,13 @@ func New(cfg Config) *Agent {
 }
 
 func (a *Agent) Run(ctx context.Context, task string, images []llm.Image) (Result, error) {
+	return a.RunWithHistory(ctx, []llm.Turn{{Role: "user", Text: task, Images: images}})
+}
+
+// RunWithHistory runs the agent loop over a multi-turn conversation. The passed
+// history already includes the current user turn (with any images), so chat
+// sessions can replay prior turns as context instead of starting from scratch.
+func (a *Agent) RunWithHistory(ctx context.Context, history []llm.Turn) (Result, error) {
 	system := `You are an autonomous coding agent with access to a shared workspace directory.
 You have tools to write files, read files, list files, edit files, search the workspace, capture screenshots, and run shell commands to test your work.
 Use tools only when the task actually requires them. For analytical, descriptive, or question-answering tasks (for example describing an attached image or explaining something), answer directly in your response without calling any tools.
@@ -72,7 +79,6 @@ When finished, output a concise summary of what you did and the result.`
 		system += "\n\n" + a.systemExtra
 	}
 
-	history := []llm.Turn{{Role: "user", Text: task, Images: images}}
 	var summary strings.Builder
 	var callLog []string
 	var usage llm.Usage

@@ -11,7 +11,7 @@
     <div class="brand">kenosm</div>
     <nav>
       <button data-tab="agents" class="tab">Agents</button>
-      <button data-tab="swarm" class="tab active">Swarm</button>
+      <button data-tab="swarm" class="tab active">Chat</button>
       <button data-tab="files" class="tab">Files</button>
       <button data-tab="stats" class="tab">Stats</button>
     </nav>
@@ -48,29 +48,32 @@
       </div>
     </section>
 
-    <!-- Swarm: a Claude-Code-like console. Left = live transcript, right = live stats. -->
+    <!-- Chat: a Claude-Code-like conversation with a single-agent / swarm toggle. Left = chat, right = live stats. -->
     <section id="tab-swarm" class="tab-panel active">
       <div class="swarm-layout">
         <div class="console">
           <div class="console-head">
-            <span class="hint">Swarm session</span>
-            <button id="btn-clear-context" class="btn small ghost danger">Clear context</button>
+            <div class="chat-tabs" id="chat-tabs"></div>
+            <button id="btn-new-chat" class="btn small">New chat</button>
           </div>
           <div class="console-scroll" id="console-scroll">
-            <div class="msg system" id="console-empty">Type a task below and press Run. Progress streams here as the agents work.</div>
+            <div class="msg system" id="console-empty">New chat. Write a message below.</div>
           </div>
           <div class="console-input">
             <div class="attach-row">
               <button id="btn-attach" class="btn small ghost">Attach image</button>
               <input type="file" id="file-input" accept="image/*" multiple hidden />
-              <span class="hint">Attach screenshots or photos to the first request — the swarm will see them.</span>
+              <span class="hint">Attach images to the next message.</span>
             </div>
             <div id="attachments" class="attachments"></div>
-            <textarea id="task" rows="2" placeholder="Create a single-page portfolio website with HTML, CSS and JS."></textarea>
+            <textarea id="task" rows="2" placeholder="Write a message…"></textarea>
             <div class="input-bar">
-              <button id="btn-run" class="btn">Run</button>
+              <div class="mode-toggle">
+                <button id="btn-mode-single" class="btn small active">Single</button>
+                <button id="btn-mode-swarm" class="btn small">Swarm</button>
+              </div>
+              <button id="btn-run" class="btn">Send</button>
               <button id="btn-stop" class="btn ghost hidden">Stop</button>
-              <button id="btn-clear-console" class="btn ghost">Clear log</button>
               <span id="run-status" class="hint"></span>
             </div>
           </div>
