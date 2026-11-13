@@ -17,7 +17,7 @@ import (
 type Config struct {
 	LLM           *llm.Gemini
 	Workspace     *workspace.Workspace
-	Browser       *browser.Browser // optional; enables the screenshot tool
+	Browser       *browser.Browser // optional; enables the browser_* tools
 	MaxIterations int
 	Log           func(kind, detail string) // optional progress callback
 	OnUsage       func(llm.Usage)           // optional: fired after each model call with its token usage
@@ -34,12 +34,14 @@ type Result struct {
 }
 
 // Agent is a tool-using loop: it repeatedly asks the model, executes any tool
-// calls (write files, read files, list files, run commands), and feeds results
-// back until the model finishes with a summary.
+// calls (write files, read files, list files, run commands, drive a browser),
+// and feeds results back until the model finishes with a summary.
 type Agent struct {
 	llm         *llm.Gemini
 	ws          *workspace.Workspace
 	browser     *browser.Browser
+	session     *browser.Session
+	runCtx      context.Context
 	maxIt       int
 	tools       []llm.Tool
 	log         func(kind, detail string)
@@ -55,7 +57,7 @@ func New(cfg Config) *Agent {
 	}
 	tools := buildTools()
 	if cfg.Browser == nil {
-		tools = withoutTool(tools, "screenshot")
+		tools = withoutPrefix(tools, "browser_")
 	}
 	return &Agent{llm: cfg.LLM, ws: cfg.Workspace, browser: cfg.Browser, maxIt: maxIt, tools: tools, log: cfg.Log, onUsage: cfg.OnUsage, systemExtra: cfg.SystemExtra}
 }
@@ -68,10 +70,19 @@ func (a *Agent) Run(ctx context.Context, task string, images []llm.Image) (Resul
 // history already includes the current user turn (with any images), so chat
 // sessions can replay prior turns as context instead of starting from scratch.
 func (a *Agent) RunWithHistory(ctx context.Context, history []llm.Turn) (Result, error) {
-	system := `You are an autonomous coding agent with access to a shared workspace directory.
-You have tools to write files, read files, list files, edit files, search the workspace, capture screenshots, and run shell commands to test your work.
+	a.runCtx = ctx
+	defer func() {
+		if a.session != nil {
+			a.session.Close()
+			a.session = nil
+		}
+	}()
+
+	system := `You are an autonomous coding agent with access to a shared workspace directory and a real web browser.
+You have tools to write files, read files, list files, edit files, search the workspace, run shell commands, and drive the browser: navigate to any site, click buttons, type into fields, scroll, read page text, and capture screenshots.
 Use tools only when the task actually requires them. For analytical, descriptive, or question-answering tasks (for example describing an attached image or explaining something), answer directly in your response without calling any tools.
-When you do create or change files, actually test them with the run_command tool before finishing.
+When you create or change files, actually test them with the run_command tool before finishing.
+When you build a web page or any UI, verify it in the browser before finishing: open it with browser_navigate, then click every button and link, scroll the page, and take a screenshot of each step (browser_click and browser_scroll save a screenshot automatically, so you can see each state). Confirm from those screenshots that everything works and looks right. If a page shows a CAPTCHA or similar challenge, read it with browser_snapshot or browser_screenshot and type the answer with browser_type.
 All file paths are relative to the workspace root. Never prefix a path with "workspace/" or an absolute directory — write "app/index.html", not "workspace/app/index.html".
 When finished, output a concise summary of what you did and the result.`
 
@@ -211,39 +222,6 @@ func (a *Agent) execute(ctx context.Context, c llm.FunctionCall) llm.FunctionRes
 			m["error"] = err.Error()
 		}
 		return resp(m)
-	case "screenshot":
-		target := cleanRelPath(c.Args["target"])
-		if target == "" {
-			target = cleanRelPath(c.Args["url"])
-		}
-		if target == "" {
-			return resp(map[string]any{"error": "screenshot requires a 'target' (URL or file path)"})
-		}
-		if a.browser == nil {
-			return resp(map[string]any{"error": "no browser available"})
-		}
-		// Resolve local (non-URL) targets against the workspace root so agents
-		// can screenshot files they just created.
-		if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
-			target = filepath.Join(a.ws.Root(), target)
-		}
-		img, err := a.browser.Screenshot(ctx, target)
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		rel := fmt.Sprintf("screenshots/shot-%d.png", time.Now().UnixNano())
-		if werr := a.ws.WriteFile(rel, string(img)); werr != nil {
-			return resp(map[string]any{"error": "save screenshot: " + werr.Error()})
-		}
-		a.noteFile(rel)
-		return llm.FunctionResponse{
-			Name:             c.Name,
-			Response:         map[string]any{"ok": true, "path": rel},
-			ID:               c.ID,
-			ThoughtSignature: c.ThoughtSignature,
-			ImageMimeType:    "image/png",
-			ImageData:        img,
-		}
 	case "edit_file":
 		path := cleanRelPath(c.Args["path"])
 		oldS, _ := c.Args["old_string"].(string)
@@ -267,9 +245,134 @@ func (a *Agent) execute(ctx context.Context, c llm.FunctionCall) llm.FunctionRes
 			return resp(map[string]any{"error": err.Error()})
 		}
 		return resp(map[string]any{"matches": matches, "count": len(matches)})
+
+	// ---- browser tools ----
+	case "browser_navigate":
+		target := strVal(c.Args["url"])
+		if target == "" {
+			return resp(map[string]any{"error": "browser_navigate requires a url"})
+		}
+		s, err := a.bsession()
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		if err := s.Navigate(a.resolveTarget(target)); err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.shotResp(c, s, map[string]any{"ok": true, "url": target})
+	case "browser_snapshot":
+		s, err := a.bsession()
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		els, err := s.Snapshot()
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return resp(map[string]any{"elements": els, "count": len(els)})
+	case "browser_click":
+		target := browser.SelectorFor(strVal(c.Args["target"]))
+		if target == "" {
+			return resp(map[string]any{"error": "browser_click requires a target (index from browser_snapshot, or a CSS selector)"})
+		}
+		s, err := a.bsession()
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		if err := s.Click(target); err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.shotResp(c, s, map[string]any{"ok": true, "clicked": target})
+	case "browser_type":
+		target := browser.SelectorFor(strVal(c.Args["target"]))
+		text := strVal(c.Args["text"])
+		if target == "" {
+			return resp(map[string]any{"error": "browser_type requires a target"})
+		}
+		s, err := a.bsession()
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		if err := s.Type(target, text); err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.shotResp(c, s, map[string]any{"ok": true, "typed_into": target})
+	case "browser_scroll":
+		amount := intVal(c.Args["amount"], 600)
+		if strings.EqualFold(strVal(c.Args["direction"]), "up") {
+			amount = -amount
+		}
+		s, err := a.bsession()
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		if err := s.Scroll(amount); err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.shotResp(c, s, map[string]any{"ok": true, "scrolled_by": amount})
+	case "browser_screenshot":
+		s, err := a.bsession()
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.shotResp(c, s, map[string]any{"ok": true})
+	case "browser_text":
+		s, err := a.bsession()
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		text, err := s.Text()
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return resp(map[string]any{"text": text})
 	default:
 		return resp(map[string]any{"error": "unknown tool: " + c.Name})
 	}
+}
+
+// bsession returns the run's shared browser session, creating it on first use.
+func (a *Agent) bsession() (*browser.Session, error) {
+	if a.session != nil {
+		return a.session, nil
+	}
+	if a.browser == nil {
+		return nil, fmt.Errorf("no browser available")
+	}
+	s, err := a.browser.NewSession(a.runCtx)
+	if err != nil {
+		return nil, err
+	}
+	a.session = s
+	return s, nil
+}
+
+// shotResp captures the current viewport, saves it to the workspace and returns
+// a tool response carrying both the saved path and the image so the model can
+// visually inspect the result of the action it just performed.
+func (a *Agent) shotResp(c llm.FunctionCall, s *browser.Session, meta map[string]any) llm.FunctionResponse {
+	img, err := s.Screenshot()
+	if err != nil {
+		return llm.FunctionResponse{Name: c.Name, Response: map[string]any{"error": err.Error()}, ID: c.ID, ThoughtSignature: c.ThoughtSignature}
+	}
+	path := fmt.Sprintf("screenshots/shot-%d.png", time.Now().UnixNano())
+	if werr := a.ws.WriteFile(path, string(img)); werr != nil {
+		return llm.FunctionResponse{Name: c.Name, Response: map[string]any{"error": "save screenshot: " + werr.Error()}, ID: c.ID, ThoughtSignature: c.ThoughtSignature}
+	}
+	a.noteFile(path)
+	meta["screenshot"] = path
+	return llm.FunctionResponse{Name: c.Name, Response: meta, ID: c.ID, ThoughtSignature: c.ThoughtSignature, ImageMimeType: "image/png", ImageData: img}
+}
+
+// resolveTarget turns a URL or workspace-relative file path into something the
+// browser can load (http(s)/file URL).
+func (a *Agent) resolveTarget(t string) string {
+	t = strings.TrimSpace(t)
+	if strings.HasPrefix(t, "http://") || strings.HasPrefix(t, "https://") || strings.HasPrefix(t, "file://") {
+		return t
+	}
+	abs := filepath.Join(a.ws.Root(), filepath.FromSlash(strings.TrimPrefix(t, "./")))
+	return "file://" + filepath.ToSlash(abs)
 }
 
 // noteFile records a workspace-relative path that this agent wrote or edited.
@@ -298,6 +401,21 @@ func cleanRelPath(v any) string {
 	return p
 }
 
+func strVal(v any) string {
+	s, _ := v.(string)
+	return strings.TrimSpace(s)
+}
+
+func intVal(v any, def int) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	}
+	return def
+}
+
 func describeTool(c llm.FunctionCall) string {
 	switch c.Name {
 	case "write_file":
@@ -320,6 +438,20 @@ func describeTool(c llm.FunctionCall) string {
 		if q, ok := c.Args["query"].(string); ok {
 			return "search_files " + q
 		}
+	case "browser_navigate":
+		return "browser_navigate " + strVal(c.Args["url"])
+	case "browser_click":
+		return "browser_click " + strVal(c.Args["target"])
+	case "browser_type":
+		return "browser_type " + strVal(c.Args["target"])
+	case "browser_scroll":
+		return "browser_scroll " + strVal(c.Args["direction"])
+	case "browser_screenshot":
+		return "browser_screenshot"
+	case "browser_snapshot":
+		return "browser_snapshot"
+	case "browser_text":
+		return "browser_text"
 	}
 	return c.Name
 }
@@ -342,7 +474,7 @@ func buildTools() []llm.Tool {
 			Name:        "read_file",
 			Description: "Read the content of a file in the workspace.",
 			Parameters: map[string]any{
-				"type":       "OBJECT",
+				"type": "OBJECT",
 				"properties": map[string]any{
 					"path": map[string]any{"type": "STRING", "description": "Relative file path inside the workspace (do NOT prefix with 'workspace/')"},
 				},
@@ -361,7 +493,7 @@ func buildTools() []llm.Tool {
 			Name:        "run_command",
 			Description: "Run a shell command inside the workspace directory and return stdout/stderr and exit code. Use it to test your work.",
 			Parameters: map[string]any{
-				"type":       "OBJECT",
+				"type": "OBJECT",
 				"properties": map[string]any{
 					"command": map[string]any{"type": "STRING", "description": "Shell command to run"},
 				},
@@ -372,7 +504,7 @@ func buildTools() []llm.Tool {
 			Name:        "edit_file",
 			Description: "Replace a substring inside a file with new text, without rewriting the whole file. Use it for targeted fixes. Returns how many replacements were made.",
 			Parameters: map[string]any{
-				"type":       "OBJECT",
+				"type": "OBJECT",
 				"properties": map[string]any{
 					"path":       map[string]any{"type": "STRING", "description": "File path inside the workspace (do NOT prefix with 'workspace/')"},
 					"old_string": map[string]any{"type": "STRING", "description": "Exact text to find (must exist in the file)"},
@@ -385,7 +517,7 @@ func buildTools() []llm.Tool {
 			Name:        "search_files",
 			Description: "Search all files in the workspace for a text query (case-insensitive) and return matching lines as 'path:line: text'.",
 			Parameters: map[string]any{
-				"type":       "OBJECT",
+				"type": "OBJECT",
 				"properties": map[string]any{
 					"query": map[string]any{"type": "STRING", "description": "Text to search for"},
 				},
@@ -393,26 +525,87 @@ func buildTools() []llm.Tool {
 			},
 		},
 		{
-			Name:        "screenshot",
-			Description: "Open a URL or local HTML file in a headless browser and capture a screenshot so you can visually inspect the interface. Returns the screenshot image for you to see.",
+			Name:        "browser_navigate",
+			Description: "Open a URL (or a workspace-relative file path) in the browser. Returns a screenshot of the loaded page.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"url": map[string]any{"type": "STRING", "description": "http(s) URL to open, or a local file path inside the workspace"},
+				},
+				"required": []any{"url"},
+			},
+		},
+		{
+			Name:        "browser_snapshot",
+			Description: "List the visible interactive elements on the current page (buttons, links, inputs) as numbered entries. Use the numbers as targets for browser_click / browser_type.",
 			Parameters: map[string]any{
 				"type":       "OBJECT",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			Name:        "browser_click",
+			Description: "Click an element on the page: pass its index from browser_snapshot (e.g. \"3\") or a CSS selector (e.g. \"#submit\"). Returns a screenshot taken right after the click.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
 				"properties": map[string]any{
-					"target": map[string]any{"type": "STRING", "description": "A URL (http/https) or a local file path inside the workspace to screenshot"},
+					"target": map[string]any{"type": "STRING", "description": "Element index from browser_snapshot, or a CSS selector"},
 				},
 				"required": []any{"target"},
+			},
+		},
+		{
+			Name:        "browser_type",
+			Description: "Type text into an input/textarea/field: pass its index from browser_snapshot or a CSS selector. Returns a screenshot after typing.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"target": map[string]any{"type": "STRING", "description": "Element index from browser_snapshot, or a CSS selector"},
+					"text":   map[string]any{"type": "STRING", "description": "Text to type"},
+				},
+				"required": []any{"target", "text"},
+			},
+		},
+		{
+			Name:        "browser_scroll",
+			Description: "Scroll the page up or down. Returns a screenshot of the new viewport so you can verify scrolled content.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"direction": map[string]any{"type": "STRING", "description": "\"down\" or \"up\""},
+					"amount":    map[string]any{"type": "NUMBER", "description": "Pixels to scroll (default 600)"},
+				},
+				"required": []any{"direction"},
+			},
+		},
+		{
+			Name:        "browser_screenshot",
+			Description: "Capture a screenshot of the current browser viewport.",
+			Parameters: map[string]any{
+				"type":       "OBJECT",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			Name:        "browser_text",
+			Description: "Return the visible text of the current page.",
+			Parameters: map[string]any{
+				"type":       "OBJECT",
+				"properties": map[string]any{},
 			},
 		},
 	}
 }
 
-// withoutTool returns a copy of tools with the named tool removed.
-func withoutTool(tools []llm.Tool, name string) []llm.Tool {
+// withoutPrefix returns a copy of tools with any tool whose name has the given
+// prefix removed.
+func withoutPrefix(tools []llm.Tool, prefix string) []llm.Tool {
 	out := make([]llm.Tool, 0, len(tools))
 	for _, t := range tools {
-		if t.Name != name {
-			out = append(out, t)
+		if strings.HasPrefix(t.Name, prefix) {
+			continue
 		}
+		out = append(out, t)
 	}
 	return out
 }

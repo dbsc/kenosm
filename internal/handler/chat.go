@@ -148,6 +148,12 @@ func (h *Swarm) SendMessage(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 		defer cancel()
 		_, _ = h.chats.AppendMessage(ctx, chatID, "assistant", "Error: "+errMsg, mode)
+	}, func() {
+		// A stopped turn leaves no reply; record a placeholder so the next
+		// message still alternates user/assistant.
+		ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
+		defer cancel()
+		_, _ = h.chats.AppendMessage(ctx, chatID, "assistant", "Stopped.", mode)
 	})
 
 	writeJSON(w, http.StatusAccepted, map[string]string{

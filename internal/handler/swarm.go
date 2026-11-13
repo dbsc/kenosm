@@ -86,7 +86,7 @@ func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 	if mode != modeSingle && mode != modeSwarm {
 		mode = modeSwarm
 	}
-	runID, _ := h.runTurn(agents, in.Task, images, nil, mode, nil, nil)
+	runID, _ := h.runTurn(agents, in.Task, images, nil, mode, nil, nil, nil)
 
 	writeJSON(w, http.StatusAccepted, map[string]string{"run_id": runID})
 }
@@ -109,7 +109,9 @@ func (h *Swarm) loadAgents(ctx context.Context) ([]swarm.Agent, error) {
 // usage event to the DB immediately, so stats update while the run executes.
 // onDone, if set, is called with the finished result right before the terminal
 // "done" event is emitted (used to persist the assistant message into a chat).
-func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, prior []llm.Turn, mode string, onDone func(*swarm.Result), onError func(string)) (string, *runState) {
+// onError/onStop receive the turn's failure/stop so a chat can keep its
+// user/assistant alternation intact.
+func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, prior []llm.Turn, mode string, onDone func(*swarm.Result), onError func(string), onStop func()) (string, *runState) {
 	runID, state := h.registry.create()
 	state.add(swarm.Event{Time: time.Now(), Type: "start", Detail: "run started"})
 
@@ -152,7 +154,12 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 		}
 		if err != nil {
 			if state.isStopped() {
-				return // the Stop handler already emitted a terminal "stopped" event
+				// The Stop handler already emitted a terminal "stopped" event;
+				// persist a placeholder reply so the chat keeps alternating.
+				if onStop != nil {
+					onStop()
+				}
+				return
 			}
 			msg := err.Error()
 			if onError != nil {
