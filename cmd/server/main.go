@@ -14,6 +14,7 @@ import (
 	"kenosm/internal/config"
 	"kenosm/internal/crypto"
 	"kenosm/internal/db"
+	"kenosm/internal/desktop"
 	"kenosm/internal/handler"
 	"kenosm/internal/logging"
 	"kenosm/internal/repository"
@@ -73,9 +74,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Desktop automation (launch programs, screenshots, mouse/keyboard) is
+	// optional: if xdotool or a screenshot tool is missing we disable it with a
+	// warning instead of refusing to start.
+	dsk, err := desktop.New(desktop.Config{})
+	if err != nil {
+		logger.Warn("desktop automation disabled", "err", err)
+		dsk = nil
+	}
+
 	admin := handler.NewAdmin(serviceRepo)
 	gateway := handler.NewGateway(serviceRepo, transportCache, reqLogger)
-	swarmHandler := handler.NewSwarm(serviceRepo, usageRepo, chatRepo, cfg.OrchestratorModel, cfg.GeminiModel, cfg.AvailableModels, ws, br)
+	swarmHandler := handler.NewSwarm(serviceRepo, usageRepo, chatRepo, cfg.OrchestratorModel, cfg.GeminiModel, cfg.AvailableModels, ws, br, dsk)
 	wsHandler := handler.NewWorkspace(ws)
 	statsHandler := handler.NewStats(usageRepo)
 

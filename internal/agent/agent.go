@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"kenosm/internal/browser"
+	"kenosm/internal/desktop"
 	"kenosm/internal/llm"
 	"kenosm/internal/workspace"
 )
@@ -18,6 +19,7 @@ type Config struct {
 	LLM           *llm.Gemini
 	Workspace     *workspace.Workspace
 	Browser       *browser.Browser // optional; enables the browser_* tools
+	Desktop       *desktop.Desktop // optional; enables the desktop_* tools
 	MaxIterations int
 	Log           func(kind, detail string) // optional progress callback
 	OnUsage       func(llm.Usage)           // optional: fired after each model call with its token usage
@@ -34,12 +36,13 @@ type Result struct {
 }
 
 // Agent is a tool-using loop: it repeatedly asks the model, executes any tool
-// calls (write files, read files, list files, run commands, drive a browser),
-// and feeds results back until the model finishes with a summary.
+// calls (write files, read files, list files, run commands, drive a browser,
+// control the desktop), and feeds results back until the model finishes.
 type Agent struct {
 	llm         *llm.Gemini
 	ws          *workspace.Workspace
 	browser     *browser.Browser
+	desktop     *desktop.Desktop
 	session     *browser.Session
 	runCtx      context.Context
 	maxIt       int
@@ -59,7 +62,10 @@ func New(cfg Config) *Agent {
 	if cfg.Browser == nil {
 		tools = withoutPrefix(tools, "browser_")
 	}
-	return &Agent{llm: cfg.LLM, ws: cfg.Workspace, browser: cfg.Browser, maxIt: maxIt, tools: tools, log: cfg.Log, onUsage: cfg.OnUsage, systemExtra: cfg.SystemExtra}
+	if cfg.Desktop == nil {
+		tools = withoutPrefix(tools, "desktop_")
+	}
+	return &Agent{llm: cfg.LLM, ws: cfg.Workspace, browser: cfg.Browser, desktop: cfg.Desktop, maxIt: maxIt, tools: tools, log: cfg.Log, onUsage: cfg.OnUsage, systemExtra: cfg.SystemExtra}
 }
 
 func (a *Agent) Run(ctx context.Context, task string, images []llm.Image) (Result, error) {
@@ -78,17 +84,7 @@ func (a *Agent) RunWithHistory(ctx context.Context, history []llm.Turn) (Result,
 		}
 	}()
 
-	system := `You are an autonomous coding agent with access to a shared workspace directory and a real web browser.
-You have tools to write files, read files, list files, edit files, search the workspace, run shell commands, and drive the browser: navigate to any site, click buttons, type into fields, scroll, read page text, and capture screenshots.
-Use tools only when the task actually requires them. For analytical, descriptive, or question-answering tasks (for example describing an attached image or explaining something), answer directly in your response without calling any tools.
-When you create or change files, actually test them with the run_command tool before finishing.
-When you build a web page or any UI, verify it in the browser before finishing: open it with browser_navigate, then click every button and link, scroll the page, and take a screenshot of each step (browser_click and browser_scroll save a screenshot automatically, so you can see each state). Confirm from those screenshots that everything works and looks right. If a page shows a CAPTCHA or similar challenge, read it with browser_snapshot or browser_screenshot and type the answer with browser_type.
-All file paths are relative to the workspace root. Never prefix a path with "workspace/" or an absolute directory — write "app/index.html", not "workspace/app/index.html".
-When finished, output a concise summary of what you did and the result.`
-
-	if a.systemExtra != "" {
-		system += "\n\n" + a.systemExtra
-	}
+	system := a.systemPrompt()
 
 	var summary strings.Builder
 	var callLog []string
@@ -153,6 +149,39 @@ When finished, output a concise summary of what you did and the result.`
 	}
 
 	return Result{Summary: summary.String(), ToolCalls: callLog, Files: dedupe(a.files), Iterations: iterations, Usage: usage}, nil
+}
+
+// systemPrompt builds the agent instructions, mentioning browser/desktop only
+// when those tools are actually enabled.
+func (a *Agent) systemPrompt() string {
+	var b strings.Builder
+	b.WriteString(`You are an autonomous coding agent with access to a shared workspace directory.`)
+	b.WriteString("\nYou have tools to write files, read files, list files, edit files, search the workspace, and run shell commands to test your work.")
+	if a.browser != nil {
+		b.WriteString("\nYou also have a real web browser: navigate to any site, click buttons, type into fields, scroll, read page text, and capture screenshots.")
+	}
+	if a.desktop != nil {
+		b.WriteString("\nYou can also control the desktop: launch programs, list and focus windows, move and click the mouse, type text, press keys, and screenshot the screen or a specific window.")
+	}
+	b.WriteString(`
+Use tools only when the task actually requires them. For analytical, descriptive, or question-answering tasks, answer directly in your response without calling any tools.
+When you create or change files, actually test them with the run_command tool before finishing.`)
+	if a.browser != nil {
+		b.WriteString(`
+When you build a web page or any UI, verify it in the browser before finishing: open it with browser_navigate, then click every button and link, scroll the page, and take a screenshot of each step (browser_click and browser_scroll save a screenshot automatically). Confirm from those screenshots that everything works and looks right. If a page shows a CAPTCHA or similar challenge, read it with browser_snapshot or browser_screenshot and type the answer with browser_type.`)
+	}
+	if a.desktop != nil {
+		b.WriteString(`
+When you launch a desktop program, verify it actually opened by taking a screenshot (desktop_screenshot), and screenshot each interaction (desktop_click, desktop_type, desktop_key and desktop_scroll capture a screenshot automatically) so you can confirm the result. Use desktop_windows to find a window and desktop_focus to bring it to the front.`)
+	}
+	b.WriteString(`
+All file paths are relative to the workspace root. Never prefix a path with "workspace/" or an absolute directory — write "app/index.html", not "workspace/app/index.html".
+When finished, output a concise summary of what you did and the result.`)
+
+	if a.systemExtra != "" {
+		b.WriteString("\n\n" + a.systemExtra)
+	}
+	return b.String()
 }
 
 // dedupe returns a copy of s with duplicates removed, preserving first-seen order.
@@ -326,6 +355,79 @@ func (a *Agent) execute(ctx context.Context, c llm.FunctionCall) llm.FunctionRes
 			return resp(map[string]any{"error": err.Error()})
 		}
 		return resp(map[string]any{"text": text})
+
+	// ---- desktop tools ----
+	case "desktop_launch":
+		program := strings.TrimSpace(strVal(c.Args["program"]))
+		if program == "" {
+			return resp(map[string]any{"error": "desktop_launch requires a program"})
+		}
+		pid, err := a.desktop.Launch(program, strSlice(c.Args["args"]), strVal(c.Args["workdir"]))
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.deskShotResp(c, map[string]any{"ok": true, "pid": pid, "program": program})
+	case "desktop_windows":
+		wins, err := a.desktop.Windows()
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return resp(map[string]any{"windows": wins, "count": len(wins)})
+	case "desktop_focus":
+		target := strVal(c.Args["target"])
+		if target == "" {
+			return resp(map[string]any{"error": "desktop_focus requires a target (window id or title substring)"})
+		}
+		if err := a.desktop.Focus(target); err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		id, title, _ := a.desktop.ActiveWindow()
+		return a.deskShotResp(c, map[string]any{"ok": true, "focused_id": id, "focused_title": title})
+	case "desktop_screenshot":
+		var img []byte
+		var err error
+		if target := strVal(c.Args["window"]); target != "" {
+			img, err = a.desktop.ScreenshotWindow(target)
+		} else {
+			img, err = a.desktop.Screenshot()
+		}
+		if err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.imageResp(c, img, map[string]any{"ok": true})
+	case "desktop_move":
+		x, y := intVal(c.Args["x"], 0), intVal(c.Args["y"], 0)
+		if err := a.desktop.MouseMove(x, y); err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return resp(map[string]any{"ok": true, "moved_to": []int{x, y}})
+	case "desktop_click":
+		x, y := intVal(c.Args["x"], 0), intVal(c.Args["y"], 0)
+		if err := a.desktop.Click(x, y, strVal(c.Args["button"])); err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.deskShotResp(c, map[string]any{"ok": true, "clicked": []int{x, y}})
+	case "desktop_type":
+		text := strVal(c.Args["text"])
+		if err := a.desktop.Type(text); err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.deskShotResp(c, map[string]any{"ok": true, "typed": text})
+	case "desktop_key":
+		key := strVal(c.Args["key"])
+		if key == "" {
+			return resp(map[string]any{"error": "desktop_key requires a key"})
+		}
+		if err := a.desktop.Key(key); err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.deskShotResp(c, map[string]any{"ok": true, "pressed": key})
+	case "desktop_scroll":
+		amount := intVal(c.Args["amount"], 1)
+		if err := a.desktop.Scroll(strVal(c.Args["direction"]), amount); err != nil {
+			return resp(map[string]any{"error": err.Error()})
+		}
+		return a.deskShotResp(c, map[string]any{"ok": true, "scrolled": amount})
 	default:
 		return resp(map[string]any{"error": "unknown tool: " + c.Name})
 	}
@@ -347,14 +449,27 @@ func (a *Agent) bsession() (*browser.Session, error) {
 	return s, nil
 }
 
-// shotResp captures the current viewport, saves it to the workspace and returns
-// a tool response carrying both the saved path and the image so the model can
-// visually inspect the result of the action it just performed.
+// shotResp captures the current browser viewport, saves it to the workspace and
+// returns a tool response carrying both the saved path and the image.
 func (a *Agent) shotResp(c llm.FunctionCall, s *browser.Session, meta map[string]any) llm.FunctionResponse {
 	img, err := s.Screenshot()
 	if err != nil {
 		return llm.FunctionResponse{Name: c.Name, Response: map[string]any{"error": err.Error()}, ID: c.ID, ThoughtSignature: c.ThoughtSignature}
 	}
+	return a.imageResp(c, img, meta)
+}
+
+// deskShotResp screenshots the desktop and returns it as the tool's image result.
+func (a *Agent) deskShotResp(c llm.FunctionCall, meta map[string]any) llm.FunctionResponse {
+	img, err := a.desktop.Screenshot()
+	if err != nil {
+		return llm.FunctionResponse{Name: c.Name, Response: map[string]any{"error": err.Error()}, ID: c.ID, ThoughtSignature: c.ThoughtSignature}
+	}
+	return a.imageResp(c, img, meta)
+}
+
+// imageResp saves a PNG screenshot to the workspace and returns it to the model.
+func (a *Agent) imageResp(c llm.FunctionCall, img []byte, meta map[string]any) llm.FunctionResponse {
 	path := fmt.Sprintf("screenshots/shot-%d.png", time.Now().UnixNano())
 	if werr := a.ws.WriteFile(path, string(img)); werr != nil {
 		return llm.FunctionResponse{Name: c.Name, Response: map[string]any{"error": "save screenshot: " + werr.Error()}, ID: c.ID, ThoughtSignature: c.ThoughtSignature}
@@ -403,7 +518,7 @@ func cleanRelPath(v any) string {
 
 func strVal(v any) string {
 	s, _ := v.(string)
-	return strings.TrimSpace(s)
+	return s
 }
 
 func intVal(v any, def int) int {
@@ -414,6 +529,20 @@ func intVal(v any, def int) int {
 		return n
 	}
 	return def
+}
+
+func strSlice(v any) []string {
+	switch a := v.(type) {
+	case []any:
+		out := make([]string, 0, len(a))
+		for _, e := range a {
+			out = append(out, strVal(e))
+		}
+		return out
+	case []string:
+		return a
+	}
+	return nil
 }
 
 func describeTool(c llm.FunctionCall) string {
@@ -446,14 +575,25 @@ func describeTool(c llm.FunctionCall) string {
 		return "browser_type " + strVal(c.Args["target"])
 	case "browser_scroll":
 		return "browser_scroll " + strVal(c.Args["direction"])
-	case "browser_screenshot":
-		return "browser_screenshot"
-	case "browser_snapshot":
-		return "browser_snapshot"
-	case "browser_text":
-		return "browser_text"
+	case "desktop_launch":
+		return "desktop_launch " + strVal(c.Args["program"])
+	case "desktop_click":
+		return "desktop_click " + strVal(c.Args["x"]) + "," + strVal(c.Args["y"])
+	case "desktop_type":
+		return "desktop_type " + truncate(strVal(c.Args["text"]), 40)
+	case "desktop_key":
+		return "desktop_key " + strVal(c.Args["key"])
+	case "desktop_focus":
+		return "desktop_focus " + strVal(c.Args["target"])
 	}
 	return c.Name
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func buildTools() []llm.Tool {
@@ -592,6 +732,107 @@ func buildTools() []llm.Tool {
 			Parameters: map[string]any{
 				"type":       "OBJECT",
 				"properties": map[string]any{},
+			},
+		},
+		{
+			Name:        "desktop_launch",
+			Description: "Launch a program on the desktop (detached). Returns the PID and a screenshot.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"program": map[string]any{"type": "STRING", "description": "Program name or path, e.g. \"xterm\" or \"/usr/bin/firefox\""},
+					"args":    map[string]any{"type": "ARRAY", "items": map[string]any{"type": "STRING"}, "description": "Command-line arguments (optional)"},
+					"workdir": map[string]any{"type": "STRING", "description": "Working directory (optional)"},
+				},
+				"required": []any{"program"},
+			},
+		},
+		{
+			Name:        "desktop_windows",
+			Description: "List visible desktop windows (id + title) so you can pick one to focus or screenshot.",
+			Parameters: map[string]any{
+				"type":       "OBJECT",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			Name:        "desktop_focus",
+			Description: "Raise and focus a window by its numeric id or a title substring. Returns a screenshot.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"target": map[string]any{"type": "STRING", "description": "Window id or title substring"},
+				},
+				"required": []any{"target"},
+			},
+		},
+		{
+			Name:        "desktop_screenshot",
+			Description: "Capture a screenshot of the whole screen, or of a specific window if 'window' (id or title) is given.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"window": map[string]any{"type": "STRING", "description": "Window id or title substring (optional; default is the whole screen)"},
+				},
+			},
+		},
+		{
+			Name:        "desktop_move",
+			Description: "Move the mouse pointer to absolute screen coordinates (x, y in pixels).",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"x": map[string]any{"type": "NUMBER", "description": "X coordinate"},
+					"y": map[string]any{"type": "NUMBER", "description": "Y coordinate"},
+				},
+				"required": []any{"x", "y"},
+			},
+		},
+		{
+			Name:        "desktop_click",
+			Description: "Move the mouse to (x, y) and click. Button is \"left\", \"middle\" or \"right\". Returns a screenshot after the click.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"x":      map[string]any{"type": "NUMBER", "description": "X coordinate"},
+					"y":      map[string]any{"type": "NUMBER", "description": "Y coordinate"},
+					"button": map[string]any{"type": "STRING", "description": "left | middle | right (default left)"},
+				},
+				"required": []any{"x", "y"},
+			},
+		},
+		{
+			Name:        "desktop_type",
+			Description: "Type text into the currently focused window. Returns a screenshot after typing.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"text": map[string]any{"type": "STRING", "description": "Text to type"},
+				},
+				"required": []any{"text"},
+			},
+		},
+		{
+			Name:        "desktop_key",
+			Description: "Press a key or key combination in the focused window, e.g. \"Return\", \"Escape\", \"ctrl+c\", \"alt+Tab\". Returns a screenshot.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"key": map[string]any{"type": "STRING", "description": "Key or combination"},
+				},
+				"required": []any{"key"},
+			},
+		},
+		{
+			Name:        "desktop_scroll",
+			Description: "Scroll the mouse wheel up or down at the current pointer position. Returns a screenshot.",
+			Parameters: map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"direction": map[string]any{"type": "STRING", "description": "\"up\" or \"down\""},
+					"amount":    map[string]any{"type": "NUMBER", "description": "Number of wheel clicks (default 1)"},
+				},
+				"required": []any{"direction"},
 			},
 		},
 	}

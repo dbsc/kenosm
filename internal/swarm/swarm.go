@@ -10,6 +10,7 @@ import (
 
 	"kenosm/internal/agent"
 	"kenosm/internal/browser"
+	"kenosm/internal/desktop"
 	"kenosm/internal/llm"
 	"kenosm/internal/transport"
 	"kenosm/internal/workspace"
@@ -32,7 +33,8 @@ type Config struct {
 	DefaultModel      string
 	AvailableModels   []string
 	Workspace         *workspace.Workspace
-	Browser           *browser.Browser // optional; enables the screenshot tool
+	Browser           *browser.Browser // optional; enables the browser_* tools
+	Desktop           *desktop.Desktop // optional; enables the desktop_* tools
 	Emitter           Emitter          // optional progress-event sink
 }
 
@@ -511,6 +513,7 @@ func (s *Swarm) runWorker(ctx context.Context, a Agent, model, systemExtra strin
 			LLM:         client,
 			Workspace:   s.cfg.Workspace,
 			Browser:     s.cfg.Browser,
+			Desktop:     s.cfg.Desktop,
 			Log:         s.workerLog(a, client),
 			OnUsage:     s.usageLog(a, client),
 			SystemExtra: systemExtra,

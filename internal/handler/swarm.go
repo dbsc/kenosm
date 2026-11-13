@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"kenosm/internal/browser"
+	"kenosm/internal/desktop"
 	"kenosm/internal/llm"
 	"kenosm/internal/repository"
 	"kenosm/internal/swarm"
@@ -31,11 +32,12 @@ type Swarm struct {
 	availableModels   []string
 	ws                *workspace.Workspace
 	browser           *browser.Browser
+	desktop           *desktop.Desktop
 	registry          *runRegistry
 	chats             *repository.ChatRepo
 }
 
-func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser) *Swarm {
+func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop) *Swarm {
 	return &Swarm{
 		repo:              repo,
 		usage:             usage,
@@ -44,6 +46,7 @@ func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *
 		availableModels:   availableModels,
 		ws:                ws,
 		browser:           br,
+		desktop:           dsk,
 		registry:          newRunRegistry(),
 		chats:             chats,
 	}
@@ -130,6 +133,7 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 		AvailableModels:   h.availableModels,
 		Workspace:         h.ws,
 		Browser:           h.browser,
+		Desktop:           h.desktop,
 		Emitter:           emitter,
 	})
 
