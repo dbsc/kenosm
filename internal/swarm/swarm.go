@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -83,14 +83,14 @@ type Result struct {
 	Usage       []UsageRecord        `json:"usage"`
 }
 
-// Run orchestrates the swarm in two stages. First the orchestrator plans the
-// STRUCTURE once: the ordered steps, a shared technical contract, per-agent
-// model assignments and dependency edges between steps. Then the swarm walks
-// that structure wave by wave (steps that don't depend on unfinished work run
-// together). At the start of each wave the orchestrator re-plans the concrete
-// tasks for that wave's steps — tasks are created fresh each time, following the
-// fixed structure but adapted to everything already delivered — and the workers
-// hand their results to the next wave through a shared progress log.
+// Run orchestrates the swarm. First the orchestrator plans the STRUCTURE: the
+// concrete steps, a shared technical contract, per-agent model assignments and
+// dependency edges between steps, aiming for at least one independent subtask per
+// agent. Then the swarm executes the steps on a continuous, dependency-aware
+// work-stealing queue: a step runs the moment its prerequisites finish (no wave
+// barrier), and an agent that finishes early immediately takes the next runnable
+// step. Blocked or overly sequential remaining work is re-decomposed on demand so
+// every agent stays busy. Results pass between steps through a shared handoff log.
 func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior []llm.Turn) (*Result, error) {
 	agents := s.cfg.Agents
 	if len(agents) == 0 {
@@ -133,25 +133,31 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	}
 
 	plan, contract, assignments, deps := o.Plan, o.Contract, o.Assignments, o.Dependencies
+	if deps == nil {
+		// No dependency info: treat every step as independent so the swarm runs
+		// as parallel as possible. The orchestrator is told to specify any
+		// required ordering explicitly via "dependencies".
+		deps = map[int][]int{}
+	}
+
+	// A coarse plan (fewer subtasks than agents) would leave agents idle. Ask the
+	// orchestrator once, before anything runs, to expand it into enough parallel
+	// subtasks for every agent.
+	if len(plan) < len(agents) && len(agents) > 1 {
+		if eplan, edeps, eusage, eerr := s.expand(ctx, orch, task, contract, plan, agents); eerr == nil && len(eplan) > len(plan) {
+			s.emit(Event{Time: time.Now(), Type: "plan", Detail: fmt.Sprintf("plan expanded to %d parallel steps for %d agents", len(eplan), len(agents))})
+			res.Usage = append(res.Usage, UsageRecord{Agent: "orchestrator", Model: orch.Model(), Usage: eusage})
+			s.emit(Event{Time: time.Now(), Type: "usage", Agent: "orchestrator", Model: orch.Model(), Usage: eusage})
+			plan, deps = eplan, edeps
+		}
+	}
+
 	res.Plan = plan
 	res.Contract = contract
 	res.Assignments = assignments
 	res.Transcript = append(res.Transcript, TranscriptEntry{Agent: "orchestrator", Role: "planner", Text: strings.Join(plan, "\n")})
 
 	s.emit(Event{Time: time.Now(), Type: "plan", Detail: fmt.Sprintf("%d steps planned", len(plan))})
-
-	// If the orchestrator gave no dependency info, fall back to fully
-	// sequential (each step depends on the previous) — preserves the original
-	// "build on each other's work" behaviour.
-	if deps == nil {
-		deps = map[int][]int{}
-		for i := 1; i < len(plan); i++ {
-			deps[i] = []int{i - 1}
-		}
-	}
-
-	n := len(plan)
-	subResults := make([]SubtaskResult, n)
 
 	// The shared contract is injected into every step's system context so agents
 	// agree on file paths, IDs, CSS classes and signatures up front.
@@ -160,46 +166,13 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 		systemExtra = "Technical contract for this task (shared file paths, IDs, CSS classes and function signatures — follow these exactly):\n" + contract
 	}
 
-	// done is the swarm's shared handoff log: every finished step appends what it
-	// delivered, and both the re-planner and the later workers read it. This is
-	// how agents pass work to each other.
-	var done strings.Builder
-
-	for wi, wave := range computeWaves(n, deps) {
-		// Re-plan the concrete tasks for this wave's steps, following the fixed
-		// structure but adapted to everything delivered so far. The first wave
-		// has nothing to adapt to yet, so it runs the plan as-is.
-		var tasks map[int]string
-		if done.Len() > 0 {
-			replanned, rusage, rerr := s.replan(ctx, orch, task, plan, contract, wave, done.String())
-			if rerr != nil {
-				s.emit(Event{Time: time.Now(), Type: "warning", Detail: "re-plan failed, using original step text: " + truncate(rerr.Error(), 160)})
-			} else {
-				tasks = replanned
-				res.Usage = append(res.Usage, UsageRecord{Agent: "orchestrator", Model: orch.Model(), Usage: rusage})
-				s.emit(Event{Time: time.Now(), Type: "usage", Agent: "orchestrator", Model: orch.Model(), Usage: rusage})
-			}
-		}
-
-		results, usage := s.runWave(ctx, wi, wave, tasks, plan, task, systemExtra, done.String(), images, assignments)
-		for idx, sr := range results {
-			subResults[idx] = sr
-		}
-		res.Usage = append(res.Usage, usage...)
-
-		// Append this wave to the handoff log for the next wave.
-		for _, idx := range wave {
-			sr := subResults[idx]
-			if sr.Error != "" {
-				done.WriteString(fmt.Sprintf("- [%s] step %d FAILED: %s\n", sr.Agent, idx+1, truncate(sr.Error, 100)))
-				continue
-			}
-			done.WriteString(fmt.Sprintf("- [%s] step %d (%s): %s (files: %s)\n",
-				sr.Agent, idx+1, truncate(sr.Task, 60), truncate(sr.Summary, 120), strings.Join(sr.Files, ", ")))
-		}
-	}
-
+	// Run the steps on a continuous, dependency-aware work queue: a step becomes
+	// runnable the moment its prerequisites finish (no wave barrier), and an
+	// agent that finishes early immediately steals the next runnable step — so
+	// all agents stay busy. Blocked work is re-decomposed on demand.
+	subResults, usage := s.execute(ctx, orch, task, plan, contract, assignments, deps, systemExtra, images, agents)
 	res.Subtasks = subResults
+	res.Usage = append(res.Usage, usage...)
 
 	files, _ := s.cfg.Workspace.ListFiles()
 	res.Files = files
@@ -222,150 +195,396 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	return res, nil
 }
 
-// runWave executes one dependency wave. It hands each step's concrete task to
-// the agents over a work-stealing queue (faster agents pick up more steps), so
-// any number of agents — 3 or 50 — stays busy until the wave finishes.
-func (s *Swarm) runWave(ctx context.Context, wave int, waveIdx []int, tasks map[int]string, plan []string, task, systemExtra, doneSummary string, images []llm.Image, assignments map[string]string) (map[int]SubtaskResult, []UsageRecord) {
-	jobs := make(chan int, len(waveIdx))
-	for _, idx := range waveIdx {
-		jobs <- idx
+// execState is the shared state of one continuous scheduling pass. Workers pull
+// runnable jobs from it, finish them, and — whenever they would otherwise sit
+// idle while blocked work remains — ask the orchestrator to re-decompose the
+// remaining work into finer, parallel subtasks.
+type execState struct {
+	mu          sync.Mutex
+	cond        *sync.Cond
+	jobs        map[int]*job
+	nextID      int
+	depCount    map[int]int   // unmet prerequisites for not-yet-runnable jobs
+	dependents  map[int][]int // reverse edges: job -> jobs that wait on it
+	ready       []int         // runnable, not-yet-dispatched job ids
+	finished    map[int]bool
+	results     map[int]SubtaskResult
+	usage       []UsageRecord
+	running     int // jobs currently executing
+	splitRounds int
+	splitting   bool
+	done        bool
+	quit        bool // run cancelled
+	agents      int
+	maxRounds   int
+	doneLog     strings.Builder
+}
+
+// job is one schedulable unit of work: an original plan step or a finer subtask
+// produced by a later re-decomposition.
+type job struct {
+	id   int
+	text string
+	deps []int
+}
+
+func newExecState(nAgents int) *execState {
+	st := &execState{
+		jobs:       map[int]*job{},
+		depCount:   map[int]int{},
+		dependents: map[int][]int{},
+		finished:   map[int]bool{},
+		results:    map[int]SubtaskResult{},
+		agents:     nAgents,
+		maxRounds:  redecomposeBudget(nAgents),
 	}
-	close(jobs)
+	st.cond = sync.NewCond(&st.mu)
+	return st
+}
 
-	names := s.fileNames()
+// execute runs the plan on a continuous, dependency-aware work-stealing queue.
+// A step becomes runnable the moment its prerequisites finish — there is no wave
+// barrier — so an agent that finishes early immediately picks up the next
+// runnable step, and every agent stays busy until the work is done. Blocked work
+// is re-decomposed on demand so idle agents have something to do.
+func (s *Swarm) execute(ctx context.Context, orch *llm.Gemini, task string, plan []string, contract string, assignments map[string]string, deps map[int][]int, systemExtra string, images []llm.Image, agents []Agent) ([]SubtaskResult, []UsageRecord) {
+	st := newExecState(len(agents))
+	for i, p := range plan {
+		st.jobs[i] = &job{id: i, text: p}
+	}
+	st.nextID = len(plan)
+	for i := range plan {
+		for _, d := range deps[i] {
+			if d < 0 || d >= len(plan) || d == i {
+				continue
+			}
+			st.jobs[i].deps = append(st.jobs[i].deps, d)
+			st.depCount[i]++
+			st.dependents[d] = append(st.dependents[d], i)
+		}
+		if st.depCount[i] == 0 {
+			st.ready = append(st.ready, i)
+		}
+	}
 
-	var mu sync.Mutex
-	results := make(map[int]SubtaskResult, len(waveIdx))
-	usage := make([]UsageRecord, 0, len(waveIdx))
+	// Wake idle workers if the run is cancelled, so they can exit instead of
+	// blocking forever on the work queue.
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			st.mu.Lock()
+			st.quit = true
+			st.cond.Broadcast()
+			st.mu.Unlock()
+		case <-stop:
+		}
+	}()
 
 	var wg sync.WaitGroup
-	for _, a := range s.cfg.Agents {
+	for _, a := range agents {
 		wg.Add(1)
 		go func(ag Agent) {
 			defer wg.Done()
-			for idx := range jobs {
-				model := resolveModel(ag, assignments, s.cfg.DefaultModel)
-
-				subtask := plan[idx]
-				if t := tasks[idx]; t != "" {
-					subtask = t
-				}
-
-				prompt := fmt.Sprintf("Overall task:\n%s\n\nFull plan (the fixed structure your step belongs to):\n- %s\n\nCurrent workspace files: %s\n\nYour step (%d of %d):\n%s\n\nWhen you finish, your summary is handed to the agents doing the later steps — note exactly what you created and how later steps should reuse it.",
-					task, strings.Join(plan, "\n- "), strings.Join(names, ", "), idx+1, len(plan), subtask)
-				if doneSummary != "" {
-					prompt += "\n\nWork completed in earlier waves (reuse these files and names, do not recreate them):\n" + doneSummary
-				}
-
-				s.emit(Event{Time: time.Now(), Type: "subtask", Agent: ag.Name, Model: model, Step: idx, Wave: wave, Detail: fmt.Sprintf("step %d/%d: %s", idx+1, len(plan), truncate(subtask, 140))})
-
-				agRes, usedModel, aerr := s.runWorker(ctx, ag, model, systemExtra, []llm.Turn{{Role: "user", Text: prompt, Images: images}})
-
-				sr := SubtaskResult{Task: subtask, Agent: ag.Name, Model: usedModel, Files: agRes.Files}
-				if aerr != nil {
-					sr.Error = aerr.Error()
-					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Step: idx, Wave: wave, Detail: "error: " + truncate(aerr.Error(), 240)})
-				} else {
-					sr.Summary = agRes.Summary
-					sr.ToolCalls = agRes.ToolCalls
-					sr.Usage = agRes.Usage
-					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Step: idx, Wave: wave, Detail: truncate(agRes.Summary, 240)})
-				}
-
-				mu.Lock()
-				results[idx] = sr
-				usage = append(usage, UsageRecord{Agent: ag.Name, Model: usedModel, Usage: agRes.Usage})
-				mu.Unlock()
-			}
+			s.worker(ctx, orch, ag, st, task, contract, assignments, systemExtra, images)
 		}(a)
 	}
 	wg.Wait()
-	return results, usage
+	close(stop)
+
+	ids := make([]int, 0, len(st.results))
+	for id := range st.results {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	out := make([]SubtaskResult, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, st.results[id])
+	}
+	return out, st.usage
 }
 
-// replan asks the orchestrator to write the concrete tasks for one wave's steps,
-// following the fixed structure (plan + contract) but adapted to what earlier
-// waves already delivered. This is what makes the tasks "created each time"
-// instead of being frozen at plan time.
-func (s *Swarm) replan(ctx context.Context, orch *llm.Gemini, task string, plan []string, contract string, wave []int, done string) (map[int]string, llm.Usage, error) {
-	var steps, example strings.Builder
-	for i, idx := range wave {
-		steps.WriteString(fmt.Sprintf("step %d: %s\n", idx, plan[idx]))
-		if i < len(wave)-1 {
-			example.WriteString(fmt.Sprintf("    \"%d\": \"<concrete instruction for step %d>\",\n", idx, idx))
+// worker is one agent's scheduling loop: pull a runnable job, run it, and record
+// the result — or become the re-decomposer when the queue has run dry but work
+// remains, so no agent idles while there is still something to do.
+func (s *Swarm) worker(ctx context.Context, orch *llm.Gemini, ag Agent, st *execState, task, contract string, assignments map[string]string, systemExtra string, images []llm.Image) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		j, split, ok := st.take()
+		if !ok {
+			return
+		}
+		if split {
+			s.redecomposeAndMerge(ctx, orch, st, task, contract)
+			continue
+		}
+
+		model := resolveModel(ag, assignments, s.cfg.DefaultModel)
+		round := st.round()
+		doneText := st.doneSnapshot()
+		prompt := workerPrompt(task, contract, doneText, j.text, s.fileNames())
+
+		s.emit(Event{Time: time.Now(), Type: "subtask", Agent: ag.Name, Model: model, Step: j.id, Wave: round, Detail: truncate(j.text, 140)})
+
+		agRes, usedModel, aerr := s.runWorker(ctx, ag, model, systemExtra, []llm.Turn{{Role: "user", Text: prompt, Images: images}})
+
+		sr := SubtaskResult{Task: j.text, Agent: ag.Name, Model: usedModel, Files: agRes.Files}
+		if aerr != nil {
+			sr.Error = aerr.Error()
+			s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Step: j.id, Wave: round, Detail: "error: " + truncate(aerr.Error(), 240)})
 		} else {
-			example.WriteString(fmt.Sprintf("    \"%d\": \"<concrete instruction for step %d>\"\n", idx, idx))
+			sr.Summary = agRes.Summary
+			sr.ToolCalls = agRes.ToolCalls
+			sr.Usage = agRes.Usage
+			s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Step: j.id, Wave: round, Detail: truncate(agRes.Summary, 240)})
+		}
+		st.finish(j.id, sr)
+	}
+}
+
+// take returns the next runnable job, or asks the caller to re-decompose the
+// remaining blocked work, or signals that the run is finished. It blocks while
+// jobs are still running (a completion will unlock their dependents).
+func (st *execState) take() (*job, bool, bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for {
+		if st.done || st.quit {
+			return nil, false, false
+		}
+		if len(st.ready) > 0 {
+			j := st.jobs[st.ready[0]]
+			st.ready = st.ready[1:]
+			st.running++
+			return j, false, true
+		}
+		pending := len(st.jobs) - len(st.finished)
+		if st.running == 0 && pending == 0 {
+			st.done = true
+			return nil, false, false
+		}
+		if st.running == 0 && pending > 0 {
+			// Every agent is idle but work remains: it is all blocked (or cyclic).
+			if st.splitting {
+				st.cond.Wait()
+				continue
+			}
+			if st.splitRounds < st.maxRounds {
+				st.splitting = true
+				return nil, true, true
+			}
+			// Re-decomposition budget exhausted: break the deadlock by forcing
+			// the blocked jobs to run anyway, guaranteeing the run terminates.
+			st.forceReady()
+			continue
+		}
+		st.cond.Wait()
+	}
+}
+
+// finish records a completed job, wakes its dependents and appends the result to
+// the shared hand-off log that later workers read.
+func (st *execState) finish(id int, sr SubtaskResult) {
+	st.mu.Lock()
+	st.running--
+	st.finished[id] = true
+	st.results[id] = sr
+	st.usage = append(st.usage, UsageRecord{Agent: sr.Agent, Model: sr.Model, Usage: sr.Usage})
+	if sr.Error != "" {
+		fmt.Fprintf(&st.doneLog, "- [%s] %s FAILED: %s\n", sr.Agent, truncate(sr.Task, 60), truncate(sr.Error, 100))
+	} else {
+		fmt.Fprintf(&st.doneLog, "- [%s] %s: %s (files: %s)\n", sr.Agent, truncate(sr.Task, 60), truncate(sr.Summary, 120), strings.Join(sr.Files, ", "))
+	}
+	for _, d := range st.dependents[id] {
+		st.depCount[d]--
+		if st.depCount[d] == 0 {
+			st.ready = append(st.ready, d)
 		}
 	}
+	st.cond.Broadcast()
+	st.mu.Unlock()
+}
 
+// forceReady breaks a deadlock (e.g. a dependency cycle the orchestrator failed
+// to resolve) by making every blocked job runnable, so the run always ends.
+func (st *execState) forceReady() {
+	for id := range st.jobs {
+		if !st.finished[id] && st.depCount[id] > 0 {
+			st.depCount[id] = 0
+			st.ready = append(st.ready, id)
+		}
+	}
+}
+
+func (st *execState) round() int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.splitRounds
+}
+
+func (st *execState) doneSnapshot() string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.doneLog.String()
+}
+
+// workerPrompt builds the single-task prompt handed to a worker. The live
+// hand-off log and current file list let each worker build on what others have
+// already finished, without recreating or colliding with their files.
+func workerPrompt(task, contract, doneText, jobText string, names []string) string {
+	var b strings.Builder
+	b.WriteString("Overall task:\n" + task + "\n\n")
+	if contract != "" {
+		b.WriteString("Technical contract (shared file paths, IDs, CSS classes and function signatures — follow these exactly):\n" + contract + "\n\n")
+	}
+	b.WriteString("Current workspace files: " + strings.Join(names, ", ") + "\n\n")
+	if doneText != "" {
+		b.WriteString("Work completed so far (reuse these files and names, do not recreate them):\n" + doneText + "\n\n")
+	}
+	b.WriteString("Your task:\n" + jobText + "\n\n")
+	b.WriteString("When you finish, summarize exactly what you created or changed and how later steps should reuse it.")
+	return b.String()
+}
+
+// redecomposeAndMerge is called by the worker chosen to re-decompose blocked
+// work. It snapshots the still-blocked jobs, asks the orchestrator to split them
+// into finer parallel subtasks, and replaces the blocked jobs with the result so
+// the idle agents have work again.
+func (s *Swarm) redecomposeAndMerge(ctx context.Context, orch *llm.Gemini, st *execState, task, contract string) {
+	st.mu.Lock()
+	var remaining []string
+	for id, j := range st.jobs {
+		if !st.finished[id] && st.depCount[id] > 0 {
+			remaining = append(remaining, j.text)
+		}
+	}
+	doneText := st.doneLog.String()
+	st.splitRounds++
+	st.mu.Unlock()
+
+	if len(remaining) == 0 {
+		st.mu.Lock()
+		st.splitting = false
+		st.cond.Broadcast()
+		st.mu.Unlock()
+		return
+	}
+
+	plan, deps, usage, err := s.redecompose(ctx, orch, task, contract, remaining, doneText, st.agents)
+
+	st.mu.Lock()
+	st.splitting = false
+	if err != nil || len(plan) == 0 {
+		st.cond.Broadcast()
+		st.mu.Unlock()
+		if err != nil {
+			s.emit(Event{Time: time.Now(), Type: "warning", Detail: "re-decomposition failed: " + truncate(err.Error(), 160)})
+		}
+		return
+	}
+	st.usage = append(st.usage, UsageRecord{Agent: "orchestrator", Model: orch.Model(), Usage: usage})
+	st.replaceBlocked(plan, deps)
+	st.cond.Broadcast()
+	st.mu.Unlock()
+
+	s.emit(Event{Time: time.Now(), Type: "usage", Agent: "orchestrator", Model: orch.Model(), Usage: usage})
+	s.emit(Event{Time: time.Now(), Type: "plan", Detail: fmt.Sprintf("remaining work re-decomposed into %d parallel steps", len(plan))})
+}
+
+// replaceBlocked drops every blocked (not-yet-runnable, unfinished) job and
+// replaces them with a freshly re-decomposed plan. It is only called when no job
+// is running, so the surviving jobs are exactly the finished ones.
+func (st *execState) replaceBlocked(plan []string, deps map[int][]int) {
+	for id := range st.jobs {
+		if !st.finished[id] {
+			delete(st.jobs, id)
+		}
+	}
+	st.depCount = map[int]int{}
+	st.dependents = map[int][]int{}
+	st.ready = nil
+	st.running = 0
+
+	base := st.nextID
+	for i, p := range plan {
+		st.jobs[base+i] = &job{id: base + i, text: p}
+	}
+	st.nextID = base + len(plan)
+
+	for i := range plan {
+		id := base + i
+		for _, d := range deps[i] {
+			if d < 0 || d >= len(plan) || d == i {
+				continue
+			}
+			dep := base + d
+			st.jobs[id].deps = append(st.jobs[id].deps, dep)
+			st.depCount[id]++
+			st.dependents[dep] = append(st.dependents[dep], id)
+		}
+		if st.depCount[id] == 0 {
+			st.ready = append(st.ready, id)
+		}
+	}
+}
+
+// redecompose asks the orchestrator to break a set of remaining (coarse or
+// sequential) work items into finer, maximally-parallel subtasks. It returns the
+// new plan and its dependencies (0-based within the new list).
+func (s *Swarm) redecompose(ctx context.Context, orch *llm.Gemini, task, contract string, remaining []string, done string, minSubtasks int) ([]string, map[int][]int, llm.Usage, error) {
 	var b strings.Builder
 	b.WriteString("You are the orchestrator of a swarm of AI agents.\n")
 	b.WriteString("Overall task:\n" + task + "\n\n")
-	b.WriteString("The plan below is the fixed structure decided up front. Keep it — do not reorder, add or remove steps — but rewrite each requested step as a concrete, self-contained instruction, using everything already completed.\n")
-	b.WriteString("Structure:\n- " + strings.Join(plan, "\n- ") + "\n\n")
 	if contract != "" {
 		b.WriteString("Shared technical contract:\n" + contract + "\n\n")
 	}
-	b.WriteString("Completed so far (reuse these files, names and results; build on them, do not recreate or diverge):\n" + done + "\n\n")
-	if names := s.fileNames(); len(names) > 0 {
-		b.WriteString("Current workspace files: " + strings.Join(names, ", ") + "\n\n")
+	if done != "" {
+		b.WriteString("Already completed (reuse these files and names, do not recreate them):\n" + done + "\n\n")
 	}
-	b.WriteString("Write concrete instructions ONLY for these steps:\n" + steps.String() + "\n")
-	b.WriteString("Return ONLY valid JSON — no markdown, no code fences, no surrounding text — exactly in this shape:\n{\n  \"tasks\": {\n" + example.String() + "  }\n}\n")
+	b.WriteString("The remaining work below is too coarse or too sequential. Re-decompose it into finer subtasks so the swarm can work in parallel:\n")
+	for i, r := range remaining {
+		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, r))
+	}
+	b.WriteString(fmt.Sprintf("\nThere are %d agents that must all stay busy. Split the remaining work into at least %d independent subtasks that can run concurrently, up to as many as genuinely make sense. Chain one subtask after another ONLY when it truly needs the earlier one's output.\n", len(s.cfg.Agents), minSubtasks))
+	b.WriteString("Return ONLY valid JSON — no markdown, no code fences, no extra text — in this shape:\n{\"plan\":[\"subtask 0\",...],\"dependencies\":{\"<index>\":[<prerequisite indices>]}}\n")
+	b.WriteString("Indices are 0-based within this new list. Independent subtasks need no \"dependencies\" entry.\n")
 
 	res, err := orch.Generate(ctx, "You are the orchestrator of a swarm of AI agents.", []llm.Turn{{Role: "user", Text: b.String()}}, nil)
 	if err != nil {
-		return nil, llm.Usage{}, err
+		return nil, nil, llm.Usage{}, err
 	}
-	tasks, err := parseWaveTasks(res.Text)
-	return tasks, res.Usage, err
+	o, err := parseOrchestration(res.Text)
+	if err != nil {
+		return nil, nil, llm.Usage{}, err
+	}
+	if o.Direct || len(o.Plan) == 0 {
+		return nil, nil, llm.Usage{}, fmt.Errorf("re-decomposition returned no plan")
+	}
+	if o.Dependencies == nil {
+		o.Dependencies = map[int][]int{}
+	}
+	return o.Plan, o.Dependencies, res.Usage, nil
 }
 
-// parseWaveTasks decodes the re-planner's JSON: step index -> concrete task.
-// It accepts both the wrapped {"tasks": {...}} form and a bare {"0": "..."}
-// object, since models occasionally drop the wrapper.
-func parseWaveTasks(raw string) (map[int]string, error) {
-	s := strings.TrimSpace(raw)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	s = strings.TrimSpace(s)
+// expand re-decomposes a coarse initial plan (fewer subtasks than agents) into
+// enough parallel subtasks for every agent, before any execution starts.
+func (s *Swarm) expand(ctx context.Context, orch *llm.Gemini, task, contract string, plan []string, agents []Agent) ([]string, map[int][]int, llm.Usage, error) {
+	return s.redecompose(ctx, orch, task, contract, plan, "", len(agents))
+}
 
-	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start < 0 || end <= start {
-		return nil, fmt.Errorf("no JSON object found in wave-task output")
+// redecomposeBudget caps how many re-decomposition rounds a single run may make,
+// scaling with the number of agents but bounded so a stuck planner cannot loop.
+func redecomposeBudget(nAgents int) int {
+	if nAgents < 1 {
+		nAgents = 1
 	}
-
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(s[start:end+1]), &top); err != nil {
-		return nil, fmt.Errorf("decode wave-task output: %w", err)
+	b := nAgents + 2
+	if b > 12 {
+		b = 12
 	}
-
-	out := make(map[int]string)
-	for key, raw := range top {
-		if key == "tasks" {
-			var inner map[string]string
-			if json.Unmarshal(raw, &inner) == nil {
-				for k, v := range inner {
-					if idx, err := strconv.Atoi(k); err == nil && idx >= 0 && strings.TrimSpace(v) != "" {
-						out[idx] = v
-					}
-				}
-			}
-			continue
-		}
-		if idx, err := strconv.Atoi(key); err == nil && idx >= 0 {
-			var v string
-			if json.Unmarshal(raw, &v) == nil && strings.TrimSpace(v) != "" {
-				out[idx] = v
-			}
-		}
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("empty wave-task output")
-	}
-	return out, nil
+	return b
 }
 
 // fileNames lists the current workspace file paths, used to tell workers and the
@@ -458,54 +677,6 @@ func lastUserText(history []llm.Turn) string {
 	return ""
 }
 
-// computeWaves groups subtask indices into dependency waves. A task with no
-// prerequisites is in wave 0; a task whose prerequisites are in earlier waves
-// lands in the first wave after them. Tasks within a wave are independent and
-// may run concurrently. Cycles are broken defensively by treating a re-visited
-// task as having no extra prerequisite.
-func computeWaves(n int, deps map[int][]int) [][]int {
-	level := make([]int, n)
-	for i := range level {
-		level[i] = -1
-	}
-	visiting := map[int]bool{}
-	var compute func(i int) int
-	compute = func(i int) int {
-		if level[i] >= 0 {
-			return level[i]
-		}
-		if visiting[i] {
-			return 0
-		}
-		visiting[i] = true
-		l := 0
-		for _, d := range deps[i] {
-			if d < 0 || d >= n || d == i {
-				continue
-			}
-			if dl := compute(d); dl+1 > l {
-				l = dl + 1
-			}
-		}
-		delete(visiting, i)
-		level[i] = l
-		return l
-	}
-
-	maxL := 0
-	for i := 0; i < n; i++ {
-		if l := compute(i); l > maxL {
-			maxL = l
-		}
-	}
-
-	waves := make([][]int, maxL+1)
-	for i := 0; i < n; i++ {
-		waves[level[i]] = append(waves[level[i]], i)
-	}
-	return waves
-}
-
 // maxSubtasks is the ceiling on how many subtasks the orchestrator may plan for
 // a given number of agents. It leaves room to exploit parallelism on genuinely
 // parallelizable work, but the orchestrator may plan as few as one subtask (or
@@ -551,14 +722,14 @@ func (s *Swarm) plan(ctx context.Context, orch *llm.Gemini, task string, images 
 			"First decide whether this task needs a swarm at all.\n"+
 			"- If the task is trivial or conversational — a greeting, small talk, a simple question, or anything a single assistant can answer directly with no tools, no files and no multi-step work — return ONLY:\n"+
 			"  {\"direct\": true, \"answer\": \"<your reply, in the same language as the task>\"}\n"+
-			"- Otherwise break the task into 1 to %d concrete subtasks. Use ONE subtask when a single agent can complete the whole job; split into several parallel subtasks only when the task genuinely decomposes into independent pieces. Never pad the plan just to give every agent work.\n"+
+			"- Otherwise break the task into concrete subtasks. KEEP EVERY AGENT BUSY: split the work into at least %d independent subtasks (one per agent) and more — up to %d — wherever the task naturally decomposes further. Prefer subtasks that can run in parallel; chain a subtask after another ONLY when it truly needs the earlier one's output, and record that ordering in \"dependencies\". Never serialize work that could be parallel.\n"+
 			"  Write a short technical CONTRACT that every subtask must obey: the exact file paths to create, shared identifiers (IDs, CSS class names), and function/API signatures, so all subtasks integrate cleanly and never collide or diverge.\n"+
 			"  Choose the best model for each agent in \"assignments\".\n"+
 			"  Return ONLY:\n"+
 			"  {\"plan\": [\"subtask 0\", ...], \"contract\": \"<shared paths, IDs, classes, signatures>\", \"assignments\": {\"<agent name>\": \"<model>\"}, \"dependencies\": {\"<subtask index>\": [<prerequisite indices>]}}.\n"+
 			"  The \"dependencies\" field maps a subtask's index (as a string) to the list of indices it must wait for. Independent subtasks have no entry, so \"dependencies\" may be {}.\n"+
 			"No markdown, no code fences, no extra text.",
-		strings.Join(names, ", "), strings.Join(s.cfg.AvailableModels, ", "), task, max)
+		strings.Join(names, ", "), strings.Join(s.cfg.AvailableModels, ", "), task, len(names), max)
 
 	if contextText := formatHistory(prior); contextText != "" {
 		prompt += "\n\nConversation so far (context only — use it to plan, do not re-answer these messages):\n" + contextText

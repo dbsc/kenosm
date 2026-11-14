@@ -10,19 +10,19 @@ import (
 // streams these to the frontend over Server-Sent Events so a user can watch
 // the agents work in real time.
 type Event struct {
-	Time      time.Time  `json:"time"`
-	Type      string     `json:"type"` // start, planning, plan, warning, direct, subtask, model, tool, subtask_done, usage, done, stopped, error
-	Agent     string     `json:"agent,omitempty"`
-	Model     string     `json:"model,omitempty"`
-	Detail    string     `json:"detail,omitempty"`
-	Usage     llm.Usage  `json:"usage,omitempty"`
-	Cost      float64    `json:"cost,omitempty"`
-	Tool      string     `json:"tool,omitempty"`      // tool name, for tool events
-	Direction string     `json:"direction,omitempty"` // "read" | "write" for tool events
-	Step      int        `json:"step,omitempty"`      // 0-based subtask index
-	Wave      int        `json:"wave,omitempty"`      // dependency wave the subtask ran in
-	Result    *Result    `json:"result,omitempty"`
-	Error     string     `json:"error,omitempty"`
+	Time      time.Time `json:"time"`
+	Type      string    `json:"type"` // start, planning, plan, warning, direct, subtask, model, tool, subtask_done, usage, done, stopped, error
+	Agent     string    `json:"agent,omitempty"`
+	Model     string    `json:"model,omitempty"`
+	Detail    string    `json:"detail,omitempty"`
+	Usage     llm.Usage `json:"usage,omitempty"`
+	Cost      float64   `json:"cost,omitempty"`
+	Tool      string    `json:"tool,omitempty"`      // tool name, for tool events
+	Direction string    `json:"direction,omitempty"` // "read" | "write" for tool events
+	Step      int       `json:"step,omitempty"`      // job id: 0-based plan index, or a unique id for a re-decomposed subtask
+	Wave      int       `json:"wave,omitempty"`      // re-decomposition round the subtask ran in (0 = original plan)
+	Result    *Result   `json:"result,omitempty"`
+	Error     string    `json:"error,omitempty"`
 }
 
 // Emitter receives progress events. It may be nil (events are then dropped).

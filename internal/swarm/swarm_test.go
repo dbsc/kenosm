@@ -2,7 +2,10 @@ package swarm
 
 import (
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestParseOrchestrationDependencies(t *testing.T) {
@@ -89,71 +92,6 @@ func TestDowngradeFallbacks(t *testing.T) {
 	}
 }
 
-func TestComputeWaves(t *testing.T) {
-	// 0 and 1 independent (wave 0), 2 depends on 0, 3 depends on 0 and 1.
-	deps := map[int][]int{2: {0}, 3: {0, 1}}
-	waves := computeWaves(4, deps)
-	// wave 0 = {0,1}, wave 1 = {2,3}
-	if len(waves) != 2 {
-		t.Fatalf("waves = %v, want 2 levels", waves)
-	}
-	if !reflect.DeepEqual(waves[0], []int{0, 1}) {
-		t.Fatalf("wave 0 = %v", waves[0])
-	}
-	if !reflect.DeepEqual(waves[1], []int{2, 3}) {
-		t.Fatalf("wave 1 = %v", waves[1])
-	}
-}
-
-func TestComputeWavesSequential(t *testing.T) {
-	deps := map[int][]int{1: {0}, 2: {1}, 3: {2}}
-	waves := computeWaves(4, deps)
-	if len(waves) != 4 {
-		t.Fatalf("waves = %v, want 4 levels (sequential)", waves)
-	}
-	for i, w := range waves {
-		if !reflect.DeepEqual(w, []int{i}) {
-			t.Fatalf("wave %d = %v, want [%d]", i, w, i)
-		}
-	}
-}
-
-func TestComputeWavesCycle(t *testing.T) {
-	deps := map[int][]int{0: {1}, 1: {0}}
-	waves := computeWaves(2, deps)
-	if len(waves) == 0 {
-		t.Fatalf("waves is empty on cycle, want non-empty")
-	}
-}
-
-func TestParseWaveTasks(t *testing.T) {
-	raw := "```json\n{\"tasks\":{\"0\":\"write index.html\",\"2\":\"test everything\"}}\n```"
-	tasks, err := parseWaveTasks(raw)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if tasks[0] != "write index.html" || tasks[2] != "test everything" || len(tasks) != 2 {
-		t.Fatalf("tasks = %v", tasks)
-	}
-
-	// Bare {"0": "..."} form (models sometimes drop the "tasks" wrapper).
-	bare, err := parseWaveTasks(`{"0":"build app","1":"test it"}`)
-	if err != nil {
-		t.Fatalf("bare parse: %v", err)
-	}
-	if bare[0] != "build app" || bare[1] != "test it" || len(bare) != 2 {
-		t.Fatalf("bare tasks = %v", bare)
-	}
-
-	// Empty string values are dropped.
-	if _, err := parseWaveTasks(`{"tasks":{"0":""}}`); err == nil {
-		t.Fatalf("expected error when all task values are empty")
-	}
-	if _, err := parseWaveTasks("no json here"); err == nil {
-		t.Fatalf("expected error for non-JSON output")
-	}
-}
-
 func TestDirectionFor(t *testing.T) {
 	reads := []string{"read_file", "search_files", "list_files", "browser_navigate", "browser_snapshot", "browser_text", "browser_screenshot", "desktop_windows", "desktop_screenshot"}
 	for _, tool := range reads {
@@ -189,5 +127,191 @@ func TestMaxSubtasks(t *testing.T) {
 		if got := maxSubtasks(c.agents); got != c.want {
 			t.Errorf("maxSubtasks(%d) = %d, want %d", c.agents, got, c.want)
 		}
+	}
+}
+
+func TestRedecomposeBudget(t *testing.T) {
+	cases := []struct {
+		agents int
+		want   int
+	}{
+		{0, 3},
+		{1, 3},
+		{3, 5},
+		{5, 7},
+		{10, 12},
+		{50, 12},
+	}
+	for _, c := range cases {
+		if got := redecomposeBudget(c.agents); got != c.want {
+			t.Errorf("redecomposeBudget(%d) = %d, want %d", c.agents, got, c.want)
+		}
+	}
+}
+
+func TestExecStateScheduling(t *testing.T) {
+	// 4 jobs: 0 and 1 independent, 2 depends on 0, 3 depends on 0 and 1.
+	st := newExecState(3)
+	st.jobs[0] = &job{id: 0, text: "a"}
+	st.jobs[1] = &job{id: 1, text: "b"}
+	st.jobs[2] = &job{id: 2, text: "c"}
+	st.jobs[3] = &job{id: 3, text: "d"}
+	st.nextID = 4
+	st.jobs[2].deps = []int{0}
+	st.jobs[3].deps = []int{0, 1}
+	st.depCount[2] = 1
+	st.depCount[3] = 2
+	st.dependents[0] = []int{2, 3}
+	st.dependents[1] = []int{3}
+	st.ready = []int{0, 1}
+
+	// The two independent jobs are handed out first.
+	j, split, ok := st.take()
+	if !ok || split || j == nil || j.id != 0 {
+		t.Fatalf("take() = %+v, split=%v, ok=%v; want job 0", j, split, ok)
+	}
+	j, split, ok = st.take()
+	if !ok || split || j == nil || j.id != 1 {
+		t.Fatalf("take() = %+v, split=%v, ok=%v; want job 1", j, split, ok)
+	}
+
+	// Finishing 0 makes 2 runnable immediately (no wave barrier); 3 still waits.
+	st.finish(0, SubtaskResult{Agent: "a", Task: "a"})
+	j, split, ok = st.take()
+	if !ok || split || j == nil || j.id != 2 {
+		t.Fatalf("take() after finish(0) = %+v, split=%v, ok=%v; want job 2", j, split, ok)
+	}
+
+	// Finishing 1 unblocks 3.
+	st.finish(1, SubtaskResult{Agent: "b", Task: "b"})
+	j, split, ok = st.take()
+	if !ok || split || j == nil || j.id != 3 {
+		t.Fatalf("take() after finish(1) = %+v, split=%v, ok=%v; want job 3", j, split, ok)
+	}
+
+	st.finish(2, SubtaskResult{Agent: "c", Task: "c"})
+	st.finish(3, SubtaskResult{Agent: "d", Task: "d"})
+
+	if _, _, ok := st.take(); ok {
+		t.Fatalf("take() after all jobs finished = ok true, want done")
+	}
+	if len(st.results) != 4 {
+		t.Fatalf("results = %d, want 4", len(st.results))
+	}
+}
+
+func TestExecStateCycleForced(t *testing.T) {
+	// Two jobs that depend on each other (a cycle). With maxRounds=0 the
+	// scheduler must force them to run rather than wait forever.
+	st := newExecState(1)
+	st.maxRounds = 0
+	st.jobs[0] = &job{id: 0, text: "a"}
+	st.jobs[1] = &job{id: 1, text: "b"}
+	st.nextID = 2
+	st.jobs[0].deps = []int{1}
+	st.jobs[1].deps = []int{0}
+	st.depCount[0] = 1
+	st.depCount[1] = 1
+	st.dependents[0] = []int{1}
+	st.dependents[1] = []int{0}
+
+	j1, split1, ok1 := st.take()
+	if !ok1 || split1 || j1 == nil {
+		t.Fatalf("take() on cycle = %+v, split=%v, ok=%v; want a forced job", j1, split1, ok1)
+	}
+	j2, split2, ok2 := st.take()
+	if !ok2 || split2 || j2 == nil {
+		t.Fatalf("second take() on cycle = %+v, split=%v, ok=%v; want a forced job", j2, split2, ok2)
+	}
+	st.finish(j1.id, SubtaskResult{Agent: "a", Task: "a"})
+	st.finish(j2.id, SubtaskResult{Agent: "b", Task: "b"})
+	if _, _, ok := st.take(); ok {
+		t.Fatalf("take() after cycle jobs done = ok true, want done")
+	}
+}
+
+func TestExecStateReplaceBlocked(t *testing.T) {
+	// 0 finished; 1 blocked on 0; 2 blocked on 1. Re-decomposition replaces the
+	// blocked chain with a finer plan.
+	st := newExecState(2)
+	st.jobs[0] = &job{id: 0, text: "a"}
+	st.jobs[1] = &job{id: 1, text: "b"}
+	st.jobs[2] = &job{id: 2, text: "c"}
+	st.nextID = 3
+	st.finished[0] = true
+	st.depCount[1] = 1
+	st.depCount[2] = 1
+	st.jobs[1].deps = []int{0}
+	st.jobs[2].deps = []int{1}
+	st.dependents[0] = []int{1}
+	st.dependents[1] = []int{2}
+
+	st.replaceBlocked([]string{"x", "y", "z"}, map[int][]int{1: {0}, 2: {1}})
+
+	if len(st.jobs) != 4 { // finished 0 + three new jobs
+		t.Fatalf("len(jobs) = %d, want 4", len(st.jobs))
+	}
+	if !st.finished[0] {
+		t.Fatalf("job 0 must remain finished")
+	}
+	// New jobs carry ids 3,4,5 with text x,y,z; 4 depends on 3, 5 depends on 4.
+	if st.depCount[3] != 0 || st.depCount[4] != 1 || st.depCount[5] != 1 {
+		t.Fatalf("depCount = %v, want {3:0, 4:1, 5:1}", st.depCount)
+	}
+	if len(st.ready) != 1 || st.ready[0] != 3 {
+		t.Fatalf("ready = %v, want [3]", st.ready)
+	}
+	if st.jobs[3].text != "x" || st.jobs[4].text != "y" || st.jobs[5].text != "z" {
+		t.Fatalf("new job texts wrong: %+v %+v %+v", st.jobs[3], st.jobs[4], st.jobs[5])
+	}
+}
+
+func TestWorkerPrompt(t *testing.T) {
+	p := workerPrompt("build a site", "use ./style.css", "- [a] write index.html: done", "write app.js", []string{"index.html"})
+	for _, want := range []string{"build a site", "use ./style.css", "write app.js", "Work completed so far", "index.html"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("workerPrompt missing %q in:\n%s", want, p)
+		}
+	}
+}
+
+func TestExecStateConcurrentWorkers(t *testing.T) {
+	// 20 independent jobs, 5 workers: every agent keeps pulling work and all
+	// jobs finish. Exercises the cond-based blocking and termination under race
+	// detection.
+	const jobs = 20
+	const workers = 5
+	st := newExecState(workers)
+	for i := 0; i < jobs; i++ {
+		st.jobs[i] = &job{id: i, text: "job"}
+	}
+	st.nextID = jobs
+	for i := 0; i < jobs; i++ {
+		st.ready = append(st.ready, i)
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				j, split, ok := st.take()
+				if !ok {
+					return
+				}
+				if split {
+					t.Errorf("unexpected split request on independent jobs")
+					return
+				}
+				time.Sleep(time.Millisecond)
+				st.finish(j.id, SubtaskResult{Agent: "a", Task: j.text})
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(st.results) != jobs {
+		t.Fatalf("results = %d, want %d", len(st.results), jobs)
 	}
 }
