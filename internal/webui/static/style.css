@@ -266,6 +266,27 @@ ol { margin: 0.25rem 0; padding-left: 1.4rem; }
 
 .live-feed { max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; font-family: ui-monospace, Menlo, monospace; font-size: 0.72rem; }
 .feed-line { border-bottom: 1px dashed var(--border); padding: 2px 0; word-break: break-word; }
+.feed-write { font-weight: 600; }
+.feed-read { color: var(--muted); }
+
+.live-cost { font-size: 1.1rem; font-weight: 600; margin-top: 0.3rem; font-variant-numeric: tabular-nums; }
+
+/* ---------- Run distribution timeline ---------- */
+.timeline { margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.4rem; }
+.tl-row { display: grid; grid-template-columns: 150px 1fr; gap: 0.6rem; align-items: center; }
+.tl-agent {
+  font-size: 0.8rem; font-weight: 600; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; text-align: right;
+}
+.tl-track {
+  position: relative; height: 22px; background: var(--panel);
+  border: 1px solid var(--border);
+}
+.tl-bar {
+  position: absolute; top: 3px; bottom: 3px; background: var(--fg); color: var(--bg);
+  font-size: 0.68rem; line-height: 15px; text-align: center; overflow: hidden;
+  white-space: nowrap; cursor: default; min-width: 2px;
+}
 
 /* ---------- Console head + danger + modal ---------- */
 .console-head {

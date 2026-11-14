@@ -14,6 +14,7 @@ import (
 	"kenosm/internal/browser"
 	"kenosm/internal/desktop"
 	"kenosm/internal/llm"
+	"kenosm/internal/pricing"
 	"kenosm/internal/repository"
 	"kenosm/internal/swarm"
 	"kenosm/internal/workspace"
@@ -35,9 +36,11 @@ type Swarm struct {
 	desktop           *desktop.Desktop
 	registry          *runRegistry
 	chats             *repository.ChatRepo
+	prices            pricing.Table
+	activity          *repository.ActivityRepo
 }
 
-func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop) *Swarm {
+func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo) *Swarm {
 	return &Swarm{
 		repo:              repo,
 		usage:             usage,
@@ -49,6 +52,8 @@ func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *
 		desktop:           dsk,
 		registry:          newRunRegistry(),
 		chats:             chats,
+		prices:            prices,
+		activity:          activity,
 	}
 }
 
@@ -120,9 +125,14 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 
 	label := truncateText(task, 200)
 	emitter := func(e swarm.Event) {
+		if e.Type == "usage" {
+			e.Cost = h.prices.Cost(e.Model, e.Usage.PromptTokens, e.Usage.CompletionTokens, e.Usage.ThoughtTokens)
+		}
 		state.add(e)
 		if e.Type == "usage" {
 			h.insertUsage(runID, label, e)
+		} else if e.Type == "tool" || e.Type == "subtask" || e.Type == "subtask_done" || e.Type == "direct" {
+			h.insertActivity(runID, e)
 		}
 	}
 
@@ -241,6 +251,39 @@ func (h *Swarm) insertUsage(runID, task string, e swarm.Event) {
 		CompletionTokens: e.Usage.CompletionTokens,
 		ThoughtTokens:    e.Usage.ThoughtTokens,
 		TotalTokens:      e.Usage.TotalTokens,
+		Cost:             e.Cost,
+	})
+}
+
+// insertActivity persists one activity event (a read/write tool call, a subtask
+// start/end, or a model's text answer) to the DB so the dashboard can replay the
+// run's feed and timeline.
+func (h *Swarm) insertActivity(runID string, e swarm.Event) {
+	if h.activity == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	direction := e.Direction
+	switch e.Type {
+	case "subtask":
+		direction = "task"
+	case "subtask_done":
+		direction = "task_done"
+	case "direct":
+		direction = "text"
+	}
+
+	_ = h.activity.Insert(ctx, repository.ActivityEntry{
+		RunID:     runID,
+		Agent:     e.Agent,
+		Model:     e.Model,
+		Direction: direction,
+		Tool:      e.Tool,
+		Detail:    e.Detail,
+		Step:      e.Step,
+		Wave:      e.Wave,
 	})
 }
 

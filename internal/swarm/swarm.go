@@ -165,7 +165,7 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	// how agents pass work to each other.
 	var done strings.Builder
 
-	for _, wave := range computeWaves(n, deps) {
+	for wi, wave := range computeWaves(n, deps) {
 		// Re-plan the concrete tasks for this wave's steps, following the fixed
 		// structure but adapted to everything delivered so far. The first wave
 		// has nothing to adapt to yet, so it runs the plan as-is.
@@ -173,7 +173,7 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 		if done.Len() > 0 {
 			replanned, rusage, rerr := s.replan(ctx, orch, task, plan, contract, wave, done.String())
 			if rerr != nil {
-				s.emit(Event{Time: time.Now(), Type: "subtask", Detail: "re-plan failed, using original step text: " + truncate(rerr.Error(), 160)})
+				s.emit(Event{Time: time.Now(), Type: "warning", Detail: "re-plan failed, using original step text: " + truncate(rerr.Error(), 160)})
 			} else {
 				tasks = replanned
 				res.Usage = append(res.Usage, UsageRecord{Agent: "orchestrator", Model: orch.Model(), Usage: rusage})
@@ -181,7 +181,7 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 			}
 		}
 
-		results, usage := s.runWave(ctx, wave, tasks, plan, task, systemExtra, done.String(), images, assignments)
+		results, usage := s.runWave(ctx, wi, wave, tasks, plan, task, systemExtra, done.String(), images, assignments)
 		for idx, sr := range results {
 			subResults[idx] = sr
 		}
@@ -225,9 +225,9 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 // runWave executes one dependency wave. It hands each step's concrete task to
 // the agents over a work-stealing queue (faster agents pick up more steps), so
 // any number of agents — 3 or 50 — stays busy until the wave finishes.
-func (s *Swarm) runWave(ctx context.Context, wave []int, tasks map[int]string, plan []string, task, systemExtra, doneSummary string, images []llm.Image, assignments map[string]string) (map[int]SubtaskResult, []UsageRecord) {
-	jobs := make(chan int, len(wave))
-	for _, idx := range wave {
+func (s *Swarm) runWave(ctx context.Context, wave int, waveIdx []int, tasks map[int]string, plan []string, task, systemExtra, doneSummary string, images []llm.Image, assignments map[string]string) (map[int]SubtaskResult, []UsageRecord) {
+	jobs := make(chan int, len(waveIdx))
+	for _, idx := range waveIdx {
 		jobs <- idx
 	}
 	close(jobs)
@@ -235,8 +235,8 @@ func (s *Swarm) runWave(ctx context.Context, wave []int, tasks map[int]string, p
 	names := s.fileNames()
 
 	var mu sync.Mutex
-	results := make(map[int]SubtaskResult, len(wave))
-	usage := make([]UsageRecord, 0, len(wave))
+	results := make(map[int]SubtaskResult, len(waveIdx))
+	usage := make([]UsageRecord, 0, len(waveIdx))
 
 	var wg sync.WaitGroup
 	for _, a := range s.cfg.Agents {
@@ -257,19 +257,19 @@ func (s *Swarm) runWave(ctx context.Context, wave []int, tasks map[int]string, p
 					prompt += "\n\nWork completed in earlier waves (reuse these files and names, do not recreate them):\n" + doneSummary
 				}
 
-				s.emit(Event{Time: time.Now(), Type: "subtask", Agent: ag.Name, Model: model, Detail: fmt.Sprintf("step %d/%d: %s", idx+1, len(plan), truncate(subtask, 140))})
+				s.emit(Event{Time: time.Now(), Type: "subtask", Agent: ag.Name, Model: model, Step: idx, Wave: wave, Detail: fmt.Sprintf("step %d/%d: %s", idx+1, len(plan), truncate(subtask, 140))})
 
 				agRes, usedModel, aerr := s.runWorker(ctx, ag, model, systemExtra, []llm.Turn{{Role: "user", Text: prompt, Images: images}})
 
 				sr := SubtaskResult{Task: subtask, Agent: ag.Name, Model: usedModel, Files: agRes.Files}
 				if aerr != nil {
 					sr.Error = aerr.Error()
-					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: "error: " + truncate(aerr.Error(), 240)})
+					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Step: idx, Wave: wave, Detail: "error: " + truncate(aerr.Error(), 240)})
 				} else {
 					sr.Summary = agRes.Summary
 					sr.ToolCalls = agRes.ToolCalls
 					sr.Usage = agRes.Usage
-					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Detail: truncate(agRes.Summary, 240)})
+					s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Step: idx, Wave: wave, Detail: truncate(agRes.Summary, 240)})
 				}
 
 				mu.Lock()
@@ -673,9 +673,30 @@ func modelChain(assigned, def string, available []string) []string {
 
 // workerLog adapts an agent's tool-call log into swarm progress events, reading
 // the client's current model so downgraded requests are attributed correctly.
-func (s *Swarm) workerLog(a Agent, client *llm.Gemini) func(kind, detail string) {
-	return func(kind, detail string) {
-		s.emit(Event{Time: time.Now(), Type: kind, Agent: a.Name, Model: client.Model(), Detail: detail})
+func (s *Swarm) workerLog(a Agent, client *llm.Gemini) func(kind, tool, detail string) {
+	return func(kind, tool, detail string) {
+		e := Event{Time: time.Now(), Type: kind, Agent: a.Name, Model: client.Model(), Tool: tool, Detail: detail}
+		if kind == "tool" {
+			e.Direction = DirectionFor(tool)
+		}
+		s.emit(e)
+	}
+}
+
+// DirectionFor classifies a tool call as a read (observing the world) or a
+// write (mutating it), for the activity feed.
+func DirectionFor(tool string) string {
+	switch tool {
+	case "read_file", "search_files", "list_files",
+		"browser_navigate", "browser_snapshot", "browser_text", "browser_screenshot",
+		"desktop_windows", "desktop_screenshot":
+		return "read"
+	case "write_file", "edit_file", "run_command",
+		"desktop_launch", "desktop_focus", "desktop_move", "desktop_click",
+		"desktop_type", "desktop_key", "desktop_scroll":
+		return "write"
+	default:
+		return "other"
 	}
 }
 

@@ -21,9 +21,9 @@ type Config struct {
 	Browser       *browser.Browser // optional; enables the browser_* tools
 	Desktop       *desktop.Desktop // optional; enables the desktop_* tools
 	MaxIterations int
-	Log           func(kind, detail string) // optional progress callback
-	OnUsage       func(llm.Usage)           // optional: fired after each model call with its token usage
-	SystemExtra   string                    // optional: appended to the agent's system prompt (e.g. a shared contract)
+	Log           func(kind, tool, detail string) // optional progress callback; tool is the tool name for tool events
+	OnUsage       func(llm.Usage)                 // optional: fired after each model call with its token usage
+	SystemExtra   string                          // optional: appended to the agent's system prompt (e.g. a shared contract)
 }
 
 // Result is what an agent did during a run.
@@ -47,7 +47,7 @@ type Agent struct {
 	runCtx      context.Context
 	maxIt       int
 	tools       []llm.Tool
-	log         func(kind, detail string)
+	log         func(kind, tool, detail string)
 	onUsage     func(llm.Usage)
 	systemExtra string
 	files       []string // paths written/edited during the run
@@ -96,7 +96,7 @@ func (a *Agent) RunWithHistory(ctx context.Context, history []llm.Turn) (Result,
 	for iterations < a.maxIt {
 		iterations++
 		if a.log != nil {
-			a.log("model", "generating response")
+			a.log("model", "", "generating response")
 		}
 		res, err := a.llm.Generate(ctx, system, history, a.tools)
 		if err != nil {
@@ -142,7 +142,7 @@ func (a *Agent) RunWithHistory(ctx context.Context, history []llm.Turn) (Result,
 			callLog = append(callLog, c.Name)
 			responses = append(responses, a.execute(ctx, c))
 			if a.log != nil {
-				a.log("tool", describeTool(c))
+				a.log("tool", c.Name, describeTool(c))
 			}
 		}
 		history = append(history, llm.Turn{Role: "user", ToolResponses: responses})

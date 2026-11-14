@@ -5,6 +5,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"kenosm/internal/pricing"
 )
 
 // Config holds runtime configuration, loaded from environment variables.
@@ -18,6 +20,7 @@ type Config struct {
 	WorkspaceDir      string
 	CommandTimeout    time.Duration
 	ShutdownTimeout   time.Duration
+	Prices            pricing.Table
 }
 
 // Load reads configuration from the environment, applying development defaults
@@ -33,6 +36,19 @@ func Load() (*Config, error) {
 		WorkspaceDir:      getenv("WORKSPACE_DIR", "workspace"),
 		CommandTimeout:    durationFromEnv("COMMAND_TIMEOUT", 30*time.Second),
 		ShutdownTimeout:   30 * time.Second,
+		Prices:            pricing.DefaultTable(),
+	}
+
+	// MODEL_PRICES overrides the built-in price table with a JSON map, e.g.
+	// {"gemini-3.8-flash":{"input":0.15,"output":0.6}} (USD per 1M tokens).
+	if s := os.Getenv("MODEL_PRICES"); s != "" {
+		if ov, err := pricing.ParseOverrides(s); err == nil {
+			for k, v := range ov {
+				cfg.Prices[k] = v
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "WARNING: MODEL_PRICES is not valid JSON; ignoring: %v\n", err)
+		}
 	}
 
 	if cfg.SecretKey == "" {

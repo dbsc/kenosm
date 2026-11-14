@@ -26,6 +26,13 @@ function fmt(n) {
   return Number(n || 0).toLocaleString("en-US");
 }
 
+function fmtCost(n) {
+  const v = Number(n || 0);
+  if (!v) return "$0";
+  if (v < 0.01) return "$" + v.toFixed(5);
+  return "$" + v.toFixed(4);
+}
+
 // ---------- Agents ----------
 let agents = [];
 let editingId = null;
@@ -457,6 +464,7 @@ async function loadStats() {
 function renderStats(d) {
   const t = d.totals || {};
   $("#stat-totals").innerHTML = `
+    <div class="stat-card"><div class="stat-num">${fmtCost(t.cost)}</div><div class="stat-label">spend (USD)</div></div>
     <div class="stat-card"><div class="stat-num">${fmt(t.total_tokens)}</div><div class="stat-label">total tokens</div></div>
     <div class="stat-card"><div class="stat-num">${fmt(t.prompt_tokens)}</div><div class="stat-label">prompt (input)</div></div>
     <div class="stat-card"><div class="stat-num">${fmt(t.completion_tokens)}</div><div class="stat-label">completion (output)</div></div>
@@ -475,10 +483,12 @@ function renderStats(d) {
         <div class="name">${esc(r.run_id)}</div>
         <div class="sub">${esc(r.task)}</div>
       </div>
-      <div class="actions"><span class="hint">${fmt(r.total_tokens)} tokens / ${fmt(r.calls)} calls</span></div>
+      <div class="actions"><span class="hint">${fmt(r.total_tokens)} tokens / ${fmt(r.calls)} calls / ${fmtCost(r.cost)}</span></div>
     </div>`
         ).join("")
       : '<p class="hint">No runs yet.</p>';
+
+  renderTimelineSelector(d.by_run);
 }
 
 // Live stats panel in the Swarm sidebar: a magpie-style, always-updating view
@@ -488,8 +498,10 @@ function renderLiveStats(d) {
   $("#live-total").textContent = fmt(t.total_tokens);
   $("#live-split").textContent =
     "in " + fmt(t.prompt_tokens) + " · out " + fmt(t.completion_tokens) + " · think " + fmt(t.thought_tokens);
+  $("#live-cost").textContent = fmtCost(t.cost);
   $("#live-by-model").innerHTML = renderBars(d.by_model);
   $("#live-by-agent").innerHTML = renderBars(d.by_agent);
+  $("#live-cost-model").innerHTML = renderCostBars(d.by_model);
 }
 
 function renderBars(rows) {
@@ -507,18 +519,33 @@ function renderBars(rows) {
     .join("");
 }
 
+function renderCostBars(rows) {
+  if (!rows || !rows.length) return '<div class="hint">no data</div>';
+  const max = Math.max.apply(null, rows.map((r) => r.cost || 0)) || 1;
+  return rows
+    .map(
+      (r) => `
+    <div class="bar-row">
+      <span class="bar-label" title="${esc(r.key)}">${esc(r.key)}</span>
+      <div class="bar-track"><div class="bar-fill" style="width:${((r.cost / max) * 100).toFixed(1)}%"></div></div>
+      <span class="bar-val">${fmtCost(r.cost)}</span>
+    </div>`
+    )
+    .join("");
+}
+
 // liveFeed appends real-time activity from the running swarm's SSE stream.
 function liveFeed(e) {
   let label = "";
   switch (e.type) {
     case "usage":
-      label = (e.agent || "") + " +" + fmt(e.usage?.total_tokens || 0) + " tok  (" + (e.model || "") + ")";
+      label = (e.agent || "") + " +" + fmt(e.usage?.total_tokens || 0) + " tok · " + fmtCost(e.cost) + "  (" + (e.model || "") + ")";
       break;
     case "model":
       label = (e.agent || "") + " generating…";
       break;
     case "tool":
-      label = (e.agent || "") + " > " + (e.detail || "");
+      label = (e.agent || "") + " " + (e.direction === "write" ? "WRITE" : e.direction === "read" ? "READ" : "·") + " " + (e.tool || "") + (e.detail ? " " + e.detail : "");
       break;
     case "subtask":
       label = (e.agent || "") + " → " + (e.detail || "");
@@ -528,6 +555,9 @@ function liveFeed(e) {
       break;
     case "direct":
       label = (e.agent || "") + " → " + (e.detail || "");
+      break;
+    case "warning":
+      label = "! " + (e.detail || "");
       break;
     case "done":
       label = "run complete";
@@ -542,6 +572,7 @@ function liveFeed(e) {
   if (!el) return;
   const line = document.createElement("div");
   line.className = "feed-line";
+  if (e.type === "tool") line.classList.add(e.direction === "write" ? "feed-write" : "feed-read");
   line.textContent = label;
   el.prepend(line);
   while (el.children.length > 40) el.removeChild(el.lastChild);
@@ -560,11 +591,76 @@ function renderGroup(rows) {
     <div class="card">
       <div class="meta">
         <div class="name">${esc(g.key)}</div>
-        <div class="sub">${fmt(g.total_tokens)} tokens (${fmt(g.prompt_tokens)} in / ${fmt(g.completion_tokens)} out) / ${fmt(g.calls)} calls</div>
+        <div class="sub">${fmt(g.total_tokens)} tokens (${fmt(g.prompt_tokens)} in / ${fmt(g.completion_tokens)} out) / ${fmt(g.calls)} calls / ${fmtCost(g.cost)}</div>
       </div>
     </div>`
     )
     .join("");
+}
+
+// ---------- Timeline (parallel distribution) ----------
+let timelineRunId = null;
+
+function renderTimelineSelector(runs) {
+  const sel = $("#timeline-run");
+  if (!sel) return;
+  const current = timelineRunId || (runs && runs.length ? runs[0].run_id : null);
+  sel.innerHTML = (runs || [])
+    .map((r) => `<option value="${esc(r.run_id)}">${esc(r.run_id)} — ${esc((r.task || "").slice(0, 60))}</option>`)
+    .join("");
+  if (current) sel.value = current;
+  if (sel.value) {
+    timelineRunId = sel.value;
+    loadTimeline(sel.value);
+  } else {
+    $("#timeline").innerHTML = '<p class="hint">No runs yet.</p>';
+  }
+}
+
+async function loadTimeline(runId) {
+  const el = $("#timeline");
+  el.innerHTML = '<p class="hint">Loading…</p>';
+  try {
+    const res = await fetch("/api/v1/runs/" + encodeURIComponent(runId) + "/timeline");
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
+    renderTimeline(data.timeline || []);
+  } catch (e) {
+    el.innerHTML = '<p class="hint">Could not load timeline.</p>';
+  }
+}
+
+function renderTimeline(bars) {
+  const el = $("#timeline");
+  if (!bars || !bars.length) {
+    el.innerHTML = '<p class="hint">No subtasks recorded for this run yet.</p>';
+    return;
+  }
+  const times = bars
+    .map((b) => new Date(b.started_at).getTime())
+    .concat(bars.filter((b) => b.ended_at).map((b) => new Date(b.ended_at).getTime()));
+  const t0 = Math.min.apply(null, times);
+  const t1 = Math.max.apply(null, times);
+  const span = Math.max(1, t1 - t0);
+  const agents = [...new Set(bars.map((b) => b.agent))];
+  const rows = agents
+    .map((a) => {
+      const ab = bars.filter((b) => b.agent === a);
+      const barsHtml = ab
+        .map((b) => {
+          const s = new Date(b.started_at).getTime();
+          const e = b.ended_at ? new Date(b.ended_at).getTime() : t1;
+          const left = (((s - t0) / span) * 100).toFixed(2);
+          const width = Math.max(2, ((e - s) / span) * 100).toFixed(2);
+          const label = "step " + (b.step + 1);
+          const title = label + " · " + (b.summary || "running…");
+          return `<div class="tl-bar" style="left:${left}%;width:${width}%" title="${esc(title)}">${esc(label)}</div>`;
+        })
+        .join("");
+      return `<div class="tl-row"><div class="tl-agent">${esc(a)}</div><div class="tl-track">${barsHtml}</div></div>`;
+    })
+    .join("");
+  el.innerHTML = rows;
 }
 
 // ---------- Modal ----------
@@ -591,6 +687,10 @@ $("#btn-stop").addEventListener("click", stopRun);
 $("#btn-new-chat").addEventListener("click", newChat);
 $("#btn-mode-single").addEventListener("click", () => setMode("single"));
 $("#btn-mode-swarm").addEventListener("click", () => setMode("swarm"));
+$("#timeline-run").addEventListener("change", () => {
+  timelineRunId = $("#timeline-run").value;
+  if (timelineRunId) loadTimeline(timelineRunId);
+});
 $("#modal-cancel").addEventListener("click", hideModal);
 $("#modal-confirm").addEventListener("click", () => {
   if (modalConfirmHandler) modalConfirmHandler();

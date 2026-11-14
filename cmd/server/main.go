@@ -58,6 +58,7 @@ func main() {
 	logRepo := repository.NewLogRepo(pool)
 	usageRepo := repository.NewUsageRepo(pool)
 	chatRepo := repository.NewChatRepo(pool)
+	activityRepo := repository.NewActivityRepo(pool)
 
 	transportCache := transport.NewCache()
 	reqLogger := logging.New(ctx, logRepo, logger, 1024)
@@ -88,13 +89,14 @@ func main() {
 
 	admin := handler.NewAdmin(serviceRepo)
 	gateway := handler.NewGateway(serviceRepo, transportCache, reqLogger)
-	swarmHandler := handler.NewSwarm(serviceRepo, usageRepo, chatRepo, cfg.OrchestratorModel, cfg.GeminiModel, cfg.AvailableModels, ws, br, dsk)
+	swarmHandler := handler.NewSwarm(serviceRepo, usageRepo, chatRepo, cfg.OrchestratorModel, cfg.GeminiModel, cfg.AvailableModels, ws, br, dsk, cfg.Prices, activityRepo)
 	wsHandler := handler.NewWorkspace(ws)
 	statsHandler := handler.NewStats(usageRepo)
+	activityHandler := handler.NewActivity(activityRepo)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(admin, gateway, swarmHandler, wsHandler, statsHandler, webui.Handler()),
+		Handler:           server.New(admin, gateway, swarmHandler, wsHandler, statsHandler, activityHandler, webui.Handler()),
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}

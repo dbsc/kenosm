@@ -16,7 +16,7 @@ func NewUsageRepo(pool *pgxpool.Pool) *UsageRepo {
 }
 
 // UsageEntry is one recorded usage line: an agent (API key) + model used for a
-// given run/task.
+// given run/task, plus the USD cost of that call.
 type UsageEntry struct {
 	RunID            string
 	Task             string
@@ -26,13 +26,14 @@ type UsageEntry struct {
 	CompletionTokens int
 	ThoughtTokens    int
 	TotalTokens      int
+	Cost             float64
 }
 
 func (r *UsageRepo) Insert(ctx context.Context, u UsageEntry) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO usage (run_id, task, agent, model, prompt_tokens, completion_tokens, thought_tokens, total_tokens)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-		u.RunID, u.Task, u.Agent, u.Model, u.PromptTokens, u.CompletionTokens, u.ThoughtTokens, u.TotalTokens,
+		`INSERT INTO usage (run_id, task, agent, model, prompt_tokens, completion_tokens, thought_tokens, total_tokens, cost)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		u.RunID, u.Task, u.Agent, u.Model, u.PromptTokens, u.CompletionTokens, u.ThoughtTokens, u.TotalTokens, u.Cost,
 	)
 	return err
 }
@@ -46,27 +47,30 @@ type Stats struct {
 }
 
 type Totals struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	ThoughtTokens    int `json:"thought_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-	Calls            int `json:"calls"`
-	Runs             int `json:"runs"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	ThoughtTokens    int     `json:"thought_tokens"`
+	TotalTokens      int     `json:"total_tokens"`
+	Cost             float64 `json:"cost"`
+	Calls            int     `json:"calls"`
+	Runs             int     `json:"runs"`
 }
 
 type GroupRow struct {
-	Key              string `json:"key"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	TotalTokens      int    `json:"total_tokens"`
-	Calls            int    `json:"calls"`
+	Key              string  `json:"key"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	TotalTokens      int     `json:"total_tokens"`
+	Cost             float64 `json:"cost"`
+	Calls            int     `json:"calls"`
 }
 
 type RunRow struct {
-	RunID       string `json:"run_id"`
-	Task        string `json:"task"`
-	TotalTokens int    `json:"total_tokens"`
-	Calls       int    `json:"calls"`
+	RunID       string  `json:"run_id"`
+	Task        string  `json:"task"`
+	TotalTokens int     `json:"total_tokens"`
+	Cost        float64 `json:"cost"`
+	Calls       int     `json:"calls"`
 }
 
 // Stats returns the current aggregated usage.
@@ -76,10 +80,10 @@ func (r *UsageRepo) Stats(ctx context.Context) (Stats, error) {
 	err := r.pool.QueryRow(ctx,
 		`SELECT COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
 		        COALESCE(SUM(thought_tokens),0), COALESCE(SUM(total_tokens),0),
-		        COUNT(*), COUNT(DISTINCT run_id)
+		        COALESCE(SUM(cost),0), COUNT(*), COUNT(DISTINCT run_id)
 		 FROM usage`,
 	).Scan(&s.Totals.PromptTokens, &s.Totals.CompletionTokens, &s.Totals.ThoughtTokens,
-		&s.Totals.TotalTokens, &s.Totals.Calls, &s.Totals.Runs)
+		&s.Totals.TotalTokens, &s.Totals.Cost, &s.Totals.Calls, &s.Totals.Runs)
 	if err != nil {
 		return s, err
 	}
@@ -92,7 +96,7 @@ func (r *UsageRepo) Stats(ctx context.Context) (Stats, error) {
 	}
 
 	rows, err := r.pool.Query(ctx,
-		`SELECT run_id, MAX(task), COALESCE(SUM(total_tokens),0), COUNT(*)
+		`SELECT run_id, MAX(task), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost),0), COUNT(*)
 		 FROM usage GROUP BY run_id
 		 ORDER BY MAX(created_at) DESC LIMIT 20`)
 	if err != nil {
@@ -102,7 +106,7 @@ func (r *UsageRepo) Stats(ctx context.Context) (Stats, error) {
 	s.ByRun = make([]RunRow, 0)
 	for rows.Next() {
 		var rr RunRow
-		if err := rows.Scan(&rr.RunID, &rr.Task, &rr.TotalTokens, &rr.Calls); err != nil {
+		if err := rows.Scan(&rr.RunID, &rr.Task, &rr.TotalTokens, &rr.Cost, &rr.Calls); err != nil {
 			return s, err
 		}
 		s.ByRun = append(s.ByRun, rr)
@@ -118,7 +122,7 @@ func (r *UsageRepo) Stats(ctx context.Context) (Stats, error) {
 // is supplied only by internal callers, never user input.
 func (r *UsageRepo) groupBy(ctx context.Context, column string) ([]GroupRow, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT `+column+` AS key, COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0), COUNT(*)
+		`SELECT `+column+` AS key, COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost),0), COUNT(*)
 		 FROM usage GROUP BY `+column+` ORDER BY SUM(total_tokens) DESC`)
 	if err != nil {
 		return nil, err
@@ -127,7 +131,7 @@ func (r *UsageRepo) groupBy(ctx context.Context, column string) ([]GroupRow, err
 	out := make([]GroupRow, 0)
 	for rows.Next() {
 		var g GroupRow
-		if err := rows.Scan(&g.Key, &g.PromptTokens, &g.CompletionTokens, &g.TotalTokens, &g.Calls); err != nil {
+		if err := rows.Scan(&g.Key, &g.PromptTokens, &g.CompletionTokens, &g.TotalTokens, &g.Cost, &g.Calls); err != nil {
 			return nil, err
 		}
 		out = append(out, g)

@@ -11,7 +11,7 @@ import (
 
 // New builds the HTTP router wiring admin CRUD, the proxy gateway, the swarm
 // orchestrator, the workspace API and the frontend together.
-func New(admin *handler.Admin, gateway *handler.Gateway, swarm *handler.Swarm, ws *handler.Workspace, stats *handler.Stats, static http.Handler) http.Handler {
+func New(admin *handler.Admin, gateway *handler.Gateway, swarm *handler.Swarm, ws *handler.Workspace, stats *handler.Stats, activity *handler.Activity, static http.Handler) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -54,6 +54,10 @@ func New(admin *handler.Admin, gateway *handler.Gateway, swarm *handler.Swarm, w
 
 	// Usage statistics.
 	r.Get("/api/v1/stats", stats.Get)
+
+	// Activity feed (what agents read/wrote) and per-run parallel timeline.
+	r.Get("/api/v1/activity", activity.List)
+	r.Get("/api/v1/runs/{runID}/timeline", activity.Timeline)
 
 	// Frontend.
 	r.Handle("/*", static)

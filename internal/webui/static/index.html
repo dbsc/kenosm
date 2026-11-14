@@ -88,13 +88,16 @@
             <h3>Usage (live)</h3>
             <div id="live-total" class="live-total">0</div>
             <div id="live-split" class="live-split hint">in 0 · out 0 · think 0</div>
+            <div id="live-cost" class="live-cost">$0.0000</div>
             <div class="ls-divider"></div>
+            <div class="live-section">spend by model</div>
+            <div id="live-cost-model" class="live-bars"></div>
             <div class="live-section">by model</div>
             <div id="live-by-model" class="live-bars"></div>
             <div class="live-section">by agent</div>
             <div id="live-by-agent" class="live-bars"></div>
             <div class="ls-divider"></div>
-            <div class="live-section">activity</div>
+            <div class="live-section">activity (reads / writes)</div>
             <div id="live-feed" class="live-feed"></div>
           </div>
         </aside>
@@ -115,7 +118,7 @@
     <!-- Stats -->
     <section id="tab-stats" class="tab-panel">
       <h2>Usage stats</h2>
-      <p class="hint">Token usage across swarm runs, grouped by model, agent (API key) and run. Updates live.</p>
+      <p class="hint">Token usage and API spend across swarm runs, grouped by model, agent (API key) and run. Updates live.</p>
       <div id="stat-totals" class="stat-grid"></div>
       <h3>By model</h3>
       <div id="stat-by-model" class="list"></div>
@@ -123,6 +126,12 @@
       <div id="stat-by-agent" class="list"></div>
       <h3>By run</h3>
       <div id="stat-by-run" class="list"></div>
+      <h3>Run distribution (parallel)</h3>
+      <p class="hint">Which agent ran each subtask and when. Bars that overlap show agents working in parallel.</p>
+      <div class="row">
+        <select id="timeline-run" style="max-width:340px"></select>
+      </div>
+      <div id="timeline" class="timeline"></div>
     </section>
   </main>
 

@@ -154,6 +154,24 @@ func TestParseWaveTasks(t *testing.T) {
 	}
 }
 
+func TestDirectionFor(t *testing.T) {
+	reads := []string{"read_file", "search_files", "list_files", "browser_navigate", "browser_snapshot", "browser_text", "browser_screenshot", "desktop_windows", "desktop_screenshot"}
+	for _, tool := range reads {
+		if got := DirectionFor(tool); got != "read" {
+			t.Errorf("DirectionFor(%q) = %q, want read", tool, got)
+		}
+	}
+	writes := []string{"write_file", "edit_file", "run_command", "desktop_launch", "desktop_focus", "desktop_move", "desktop_click", "desktop_type", "desktop_key", "desktop_scroll"}
+	for _, tool := range writes {
+		if got := DirectionFor(tool); got != "write" {
+			t.Errorf("DirectionFor(%q) = %q, want write", tool, got)
+		}
+	}
+	if got := DirectionFor("something_else"); got != "other" {
+		t.Errorf("DirectionFor(unknown) = %q, want other", got)
+	}
+}
+
 func TestMaxSubtasks(t *testing.T) {
 	cases := []struct {
 		agents int
