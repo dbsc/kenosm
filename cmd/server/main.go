@@ -90,6 +90,12 @@ func main() {
 		logger.Error("init workspace", "err", err)
 		os.Exit(1)
 	}
+	// Materialize the versioned design library (icons, templates, UI/UX database)
+	// into the workspace so agents have it even on a fresh clone or after a clear.
+	ws.SetAssetsSource(cfg.AssetsDir)
+	if err := ws.SeedAssets(); err != nil {
+		logger.Warn("seed design assets", "err", err)
+	}
 
 	br, err := browser.New(browser.Config{})
 	if err != nil {

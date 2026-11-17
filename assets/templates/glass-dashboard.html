@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Prism — glass dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #0b0e1a;
+    --panel: rgba(255,255,255,0.055);
+    --border: rgba(255,255,255,0.09);
+    --text: #eef1ff;
+    --muted: #8b92b8;
+    --green: #34d399;
+    --blue: #60a5fa;
+    --violet: #a78bfa;
+    --pink: #f472b6;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    background:
+      radial-gradient(50% 50% at 80% 0%, rgba(167,139,250,0.16), transparent 60%),
+      radial-gradient(40% 40% at 0% 20%, rgba(96,165,250,0.14), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px clamp(16px, 4vw, 40px) 64px; }
+
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
+  header h1 { font-size: 22px; font-weight: 700; }
+  header .avatar {
+    width: 38px; height: 38px; border-radius: 50%;
+    background: linear-gradient(120deg, var(--violet), var(--pink));
+    display: grid; place-items: center; font-weight: 700; font-size: 14px;
+  }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 18px; margin-bottom: 24px; }
+
+  /* Glass card with 3D tilt on hover */
+  .card {
+    position: relative;
+    padding: 22px; border-radius: 18px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    backdrop-filter: blur(14px);
+    transform-style: preserve-3d;
+    transition: transform .25s ease, box-shadow .25s ease;
+  }
+  .card:hover { box-shadow: 0 24px 48px rgba(0,0,0,0.45); }
+  .card .icon {
+    width: 42px; height: 42px; border-radius: 12px;
+    display: grid; place-items: center; margin-bottom: 16px;
+  }
+  .card .label { color: var(--muted); font-size: 13px; }
+  .card .value { font-size: 28px; font-weight: 700; margin-top: 6px; }
+  .card .delta { font-size: 12px; margin-top: 8px; }
+  .up { color: var(--green); } .down { color: var(--pink); }
+
+  .panel {
+    padding: 24px; border-radius: 18px; margin-bottom: 24px;
+    background: var(--panel); border: 1px solid var(--border);
+    backdrop-filter: blur(14px);
+  }
+  .panel h2 { font-size: 16px; margin-bottom: 18px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 12px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+  td .coin { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.buy { background: rgba(52,211,153,0.15); color: var(--green); }
+  .badge.sell { background: rgba(244,114,182,0.15); color: var(--pink); }
+
+  @media (max-width: 600px) { table { font-size: 12px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Portfolio</h1>
+    <div class="avatar">K</div>
+  </header>
+
+  <div class="grid">
+    <div class="card" data-tilt>
+      <div class="icon" style="background:rgba(96,165,250,.16);color:var(--blue)">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1v22"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+      </div>
+      <div class="label">Total balance</div>
+      <div class="value">$128,420</div>
+      <div class="delta up">▲ 12.4% this month</div>
+    </div>
+
+    <div class="card" data-tilt>
+      <div class="icon" style="background:rgba(167,139,250,.16);color:var(--violet)">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 7-8.5 8.5-5-5L2 17"/><path d="M16 7h6v6"/></svg>
+      </div>
+      <div class="label">Profit / loss</div>
+      <div class="value">+$6,120</div>
+      <div class="delta up">▲ 5.1% today</div>
+    </div>
+
+    <div class="card" data-tilt>
+      <div class="icon" style="background:rgba(52,211,153,.16);color:var(--green)">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+      </div>
+      <div class="label">Active positions</div>
+      <div class="value">8</div>
+      <div class="delta up">2 opened today</div>
+    </div>
+
+    <div class="card" data-tilt>
+      <div class="icon" style="background:rgba(244,114,182,.16);color:var(--pink)">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></svg>
+      </div>
+      <div class="label">Wallet cash</div>
+      <div class="value">$18,050</div>
+      <div class="delta down">▼ 0.8%</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Recent activity</h2>
+    <table>
+      <thead><tr><th>Asset</th><th>Action</th><th>Amount</th><th>Value</th><th>Time</th></tr></thead>
+      <tbody>
+        <tr><td><div class="coin">BTC <span style="color:var(--muted)">Bitcoin</span></div></td><td><span class="badge buy">Buy</span></td><td>0.25</td><td>$16,200</td><td>2 min ago</td></tr>
+        <tr><td><div class="coin">ETH <span style="color:var(--muted)">Ethereum</span></div></td><td><span class="badge sell">Sell</span></td><td>1.80</td><td>$5,940</td><td>1 h ago</td></tr>
+        <tr><td><div class="coin">SOL <span style="color:var(--muted)">Solana</span></div></td><td><span class="badge buy">Buy</span></td><td>12.0</td><td>$2,160</td><td>3 h ago</td></tr>
+        <tr><td><div class="coin">USDC <span style="color:var(--muted)">USD Coin</span></div></td><td><span class="badge buy">Buy</span></td><td>4,000</td><td>$4,000</td><td>Yesterday</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  // Lightweight 3D tilt: rotate the card toward the cursor on hover.
+  document.querySelectorAll('[data-tilt]').forEach(card => {
+    card.addEventListener('mousemove', e => {
+      const r = card.getBoundingClientRect();
+      const x = (e.clientX - r.left) / r.width - 0.5;
+      const y = (e.clientY - r.top) / r.height - 0.5;
+      card.style.transform = `perspective(700px) rotateY(${x * 12}deg) rotateX(${-y * 12}deg) translateY(-4px)`;
+    });
+    card.addEventListener('mouseleave', () => { card.style.transform = ''; });
+  });
+</script>
+</body>
+</html>

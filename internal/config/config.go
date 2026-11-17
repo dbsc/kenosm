@@ -21,6 +21,7 @@ type Config struct {
 	AvailableModels    []string
 	DisabledModules    []string
 	WorkspaceDir       string
+	AssetsDir          string
 	CommandTimeout     time.Duration
 	ShutdownTimeout    time.Duration
 	MaxConcurrentRuns  int
@@ -46,6 +47,7 @@ func Load() (*Config, error) {
 		AvailableModels:    splitCSV(getenv("AVAILABLE_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite,gemini-flash-latest")),
 		DisabledModules:    splitCSV(getenv("DISABLED_MODULES", "")),
 		WorkspaceDir:       getenv("WORKSPACE_DIR", "workspace"),
+		AssetsDir:          getenv("ASSETS_DIR", "assets"),
 		CommandTimeout:     durationFromEnv("COMMAND_TIMEOUT", 30*time.Second),
 		ShutdownTimeout:    durationFromEnv("SHUTDOWN_TIMEOUT", 30*time.Second),
 		MaxConcurrentRuns:  intFromEnv("MAX_CONCURRENT_RUNS", 1),

@@ -38,11 +38,16 @@ func (h *Workspace) List(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"files": files})
 }
 
-// Clear wipes the workspace, removing all files the agents created.
+// Clear wipes the workspace, removing all files the agents created, then
+// restores the design library so a cleared workspace still has assets.
 func (h *Workspace) Clear(w http.ResponseWriter, _ *http.Request) {
 	h.ws.CleanupProcesses()
 	if err := h.ws.Clear(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := h.ws.SeedAssets(); err != nil {
+		writeError(w, http.StatusInternalServerError, "clear ok, reseed failed: "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"cleared": true})

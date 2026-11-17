@@ -3,6 +3,7 @@ package workspace
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 type Workspace struct {
 	root           string
 	commandTimeout time.Duration
+	assetsSource   string // optional versioned design library copied into <root>/assets
 	mu             sync.Mutex
 }
 
@@ -35,6 +37,72 @@ func New(root string, commandTimeout time.Duration) (*Workspace, error) {
 }
 
 func (w *Workspace) Root() string { return w.root }
+
+// SetAssetsSource points the workspace at a versioned design library directory.
+// When set, SeedAssets copies that tree into <root>/assets so agents always have
+// the icons, templates and UI/UX database regardless of how the workspace was
+// cleared. If the directory is absent, seeding is silently skipped.
+func (w *Workspace) SetAssetsSource(src string) {
+	w.assetsSource = src
+}
+
+// SeedAssets copies the configured design library into <root>/assets, but only
+// when that directory does not already exist. Clear() removes <root>/assets
+// first, so seeding after a clear restores a pristine copy; a warm restart
+// leaves an existing (possibly agent-touched) copy alone.
+func (w *Workspace) SeedAssets() error {
+	if w.assetsSource == "" {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	dst := filepath.Join(w.root, "assets")
+	if _, err := os.Stat(dst); err == nil {
+		return nil // already seeded
+	}
+	return copyTree(w.assetsSource, dst)
+}
+
+// copyTree recursively copies src into dst, preserving file modes and skipping
+// symlinks. It is used to materialize the versioned design library inside the
+// runtime workspace.
+func copyTree(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		return copyFile(path, target, info.Mode())
+	})
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
 
 // Clear removes every file and directory inside the workspace, resetting the
 // agents' working context for a fresh run.

@@ -108,3 +108,73 @@ func TestResolveRejectsEscape(t *testing.T) {
 		t.Fatalf("err = %v, want mention of escape", err)
 	}
 }
+
+func TestSeedAssetsCopiesLibrary(t *testing.T) {
+	w := newTestWorkspace(t)
+
+	src := filepath.Join(t.TempDir(), "lib")
+	for _, p := range []string{"README.md", "icons/a.svg", "uiux/scripts/search.py"} {
+		full := filepath.Join(src, p)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(p), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w.SetAssetsSource(src)
+	if err := w.SeedAssets(); err != nil {
+		t.Fatalf("SeedAssets: %v", err)
+	}
+
+	for _, p := range []string{"assets/README.md", "assets/icons/a.svg", "assets/uiux/scripts/search.py"} {
+		if _, err := os.Stat(filepath.Join(w.Root(), filepath.FromSlash(p))); err != nil {
+			t.Fatalf("expected %s seeded: %v", p, err)
+		}
+	}
+
+	// Seeding is idempotent: a second call must not fail or duplicate.
+	if err := w.SeedAssets(); err != nil {
+		t.Fatalf("second SeedAssets: %v", err)
+	}
+}
+
+func TestSeedAssetsRestoresAfterClear(t *testing.T) {
+	w := newTestWorkspace(t)
+
+	src := filepath.Join(t.TempDir(), "lib")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "DESIGN.md"), []byte("design"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w.SetAssetsSource(src)
+
+	if err := w.SeedAssets(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(w.Root(), "assets", "DESIGN.md")); err == nil {
+		t.Fatal("assets should be gone after Clear")
+	}
+	if err := w.SeedAssets(); err != nil {
+		t.Fatalf("re-seed after clear: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(w.Root(), "assets", "DESIGN.md")); err != nil {
+		t.Fatalf("assets not restored after re-seed: %v", err)
+	}
+}
+
+func TestSeedAssetsNoSourceIsNoop(t *testing.T) {
+	w := newTestWorkspace(t)
+	if err := w.SeedAssets(); err != nil {
+		t.Fatalf("SeedAssets with no source: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(w.Root(), "assets")); err == nil {
+		t.Fatal("assets dir must not be created when no source is configured")
+	}
+}

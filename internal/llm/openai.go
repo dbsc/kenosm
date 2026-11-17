@@ -204,10 +204,10 @@ type openaiRequest struct {
 }
 
 type openaiMessage struct {
-	Role       string          `json:"role"`
-	Content    any             `json:"content,omitempty"`
+	Role       string           `json:"role"`
+	Content    any              `json:"content,omitempty"`
 	ToolCalls  []openaiToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
 type openaiToolCall struct {
@@ -245,8 +245,8 @@ type openaiFunction struct {
 type openaiResponse struct {
 	Choices []struct {
 		Message struct {
-			Role      string          `json:"role"`
-			Content   string          `json:"content"`
+			Role      string           `json:"role"`
+			Content   string           `json:"content"`
 			ToolCalls []openaiToolCall `json:"tool_calls"`
 		} `json:"message"`
 	} `json:"choices"`

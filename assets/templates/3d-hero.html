@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Aurora — 3D hero</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #05060f;
+    --panel: rgba(255,255,255,0.06);
+    --text: #eef0ff;
+    --muted: #9aa0c3;
+    --accent: #7c5cff;
+    --accent2: #22d3ee;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: 'Space Grotesk', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    overflow-x: hidden;
+  }
+
+  /* Aurora background */
+  .bg {
+    position: fixed; inset: 0; z-index: -2;
+    background:
+      radial-gradient(60% 80% at 15% 20%, rgba(124,92,255,0.35), transparent 60%),
+      radial-gradient(50% 70% at 85% 30%, rgba(34,211,238,0.28), transparent 60%),
+      radial-gradient(60% 60% at 50% 100%, rgba(255,80,160,0.18), transparent 60%),
+      var(--bg);
+  }
+
+  /* Glassmorphism nav */
+  nav {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px clamp(20px, 6vw, 64px);
+    backdrop-filter: blur(14px);
+    background: rgba(5,6,15,0.5);
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  .logo { font-weight: 700; letter-spacing: 0.5px; }
+  .logo span { color: var(--accent2); }
+  nav .links { display: flex; gap: 28px; }
+  nav a { color: var(--muted); text-decoration: none; font-size: 14px; transition: color .2s; }
+  nav a:hover { color: var(--text); }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 11px 20px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.12);
+    background: linear-gradient(120deg, var(--accent), var(--accent2));
+    color: #fff; font-weight: 600; cursor: pointer; text-decoration: none;
+    box-shadow: 0 10px 30px rgba(124,92,255,0.35);
+    transition: transform .2s, box-shadow .2s;
+  }
+  .btn:hover { transform: translateY(-2px); box-shadow: 0 16px 40px rgba(124,92,255,0.5); }
+
+  /* Hero */
+  .hero {
+    display: grid; grid-template-columns: 1fr 1fr; align-items: center;
+    gap: clamp(24px, 5vw, 72px);
+    max-width: 1200px; margin: 0 auto; padding: clamp(48px, 10vh, 120px) clamp(20px, 6vw, 64px);
+    min-height: calc(100vh - 65px);
+  }
+  .hero h1 {
+    font-size: clamp(40px, 7vw, 76px); line-height: 1.02; letter-spacing: -2px;
+  }
+  .hero h1 .grad {
+    background: linear-gradient(90deg, var(--accent2), var(--accent), #ff50a0);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hero p { color: var(--muted); font-size: 18px; line-height: 1.6; margin: 24px 0 36px; max-width: 44ch; }
+  .hero .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .stat { display: flex; gap: 32px; margin-top: 56px; }
+  .stat b { display: block; font-size: 26px; }
+  .stat span { color: var(--muted); font-size: 13px; }
+
+  #canvas { width: 100%; height: 100%; min-height: 360px; }
+
+  @media (max-width: 860px) {
+    .hero { grid-template-columns: 1fr; }
+    #canvas { min-height: 260px; }
+    nav .links { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="bg"></div>
+
+<nav>
+  <div class="logo">Aurora<span>.</span></div>
+  <div class="links"><a href="#">Product</a><a href="#">Pricing</a><a href="#">Docs</a><a href="#">Blog</a></div>
+  <a class="btn" href="#">Get started
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+  </a>
+</nav>
+
+<section class="hero">
+  <div>
+    <h1>Build the<br/>future in <span class="grad">3D</span></h1>
+    <p>A modern starter that pairs a Three.js canvas with glassmorphism and
+    gradient design. Copy these techniques into your own landing pages.</p>
+    <div class="row">
+      <a class="btn" href="#">Launch app</a>
+      <a class="btn" style="background:var(--panel); box-shadow:none; border:1px solid rgba(255,255,255,.12)" href="#">View docs</a>
+    </div>
+    <div class="stat">
+      <div><b>12k+</b><span>users</span></div>
+      <div><b>99.9%</b><span>uptime</span></div>
+      <div><b>4.9★</b><span>rating</span></div>
+    </div>
+  </div>
+  <canvas id="canvas"></canvas>
+</section>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+  const canvas = document.getElementById('canvas');
+  const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(canvas.clientWidth, canvas.clientHeight);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, canvas.clientWidth / canvas.clientHeight, 0.1, 100);
+  camera.position.z = 6;
+
+  // Central torus knot, rotating.
+  const knot = new THREE.Mesh(
+    new THREE.TorusKnotGeometry(1.4, 0.4, 220, 32),
+    new THREE.MeshStandardMaterial({ color: 0x7c5cff, roughness: 0.25, metalness: 0.7 })
+  );
+  scene.add(knot);
+
+  // Particle field.
+  const stars = new THREE.BufferGeometry();
+  const pos = new Float32Array(600 * 3);
+  for (let i = 0; i < 600; i++) {
+    pos[i*3]   = (Math.random() - 0.5) * 12;
+    pos[i*3+1] = (Math.random() - 0.5) * 12;
+    pos[i*3+2] = (Math.random() - 0.5) * 12;
+  }
+  stars.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const points = new THREE.Points(stars, new THREE.PointsMaterial({ color: 0x22d3ee, size: 0.03 }));
+  scene.add(points);
+
+  const light1 = new THREE.PointLight(0x7c5cff, 1.4, 20); light1.position.set(4, 4, 4); scene.add(light1);
+  const light2 = new THREE.PointLight(0x22d3ee, 1.1, 20); light2.position.set(-4, -2, 3); scene.add(light2);
+  const ambient = new THREE.AmbientLight(0x222244); scene.add(ambient);
+
+  function resize() {
+    renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+    camera.aspect = canvas.clientWidth / canvas.clientHeight;
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize', resize);
+
+  function animate() {
+    requestAnimationFrame(animate);
+    knot.rotation.x += 0.004;
+    knot.rotation.y += 0.006;
+    points.rotation.y -= 0.001;
+    renderer.render(scene, camera);
+  }
+  animate();
+</script>
+</body>
+</html>
