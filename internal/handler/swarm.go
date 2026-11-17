@@ -252,12 +252,20 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 	// into the registry synchronously so Stop works even if called immediately.
 	ctx, cancel := context.WithCancel(context.Background())
 	state.setCancel(cancel)
+	runCtx, cancelRun := context.WithTimeout(ctx, runTimeout)
+
+	// The run's semaphore slot must be released exactly once, even if the worker
+	// goroutine hangs in a blocking call that ignores cancellation. The goroutine
+	// releases on its way out, and a watchdog also releases when the run's hard
+	// deadline fires (or the run is stopped), so a stuck agent can never wedge
+	// MAX_CONCURRENT_RUNS forever.
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(h.releaseRun) }
 
 	go func() {
 		defer cancel()
-		defer h.releaseRun()
-		runCtx, cancelRun := context.WithTimeout(ctx, runTimeout)
 		defer cancelRun()
+		defer release()
 
 		var result *swarm.Result
 		var err error
@@ -290,6 +298,15 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 			onDone(result)
 		}
 		state.add(swarm.Event{Time: time.Now(), Type: "done", Result: result})
+	}()
+
+	// Watchdog: bound the semaphore slot by the run context itself, independent of
+	// the worker goroutine's liveness. If a worker hangs in a tool that ignores
+	// cancellation, this releases the slot on Stop (or at the run deadline) so the
+	// next task can start instead of getting "too many concurrent runs".
+	go func() {
+		<-runCtx.Done()
+		release()
 	}()
 
 	return runID, state

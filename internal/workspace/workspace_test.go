@@ -1,10 +1,12 @@
 package workspace
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestWorkspace(t *testing.T) *Workspace {
@@ -176,5 +178,30 @@ func TestSeedAssetsNoSourceIsNoop(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(w.Root(), "assets")); err == nil {
 		t.Fatal("assets dir must not be created when no source is configured")
+	}
+}
+
+func TestRunCommandDoesNotHangOnBackgroundChild(t *testing.T) {
+	w := newTestWorkspace(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// A backgrounded child that outlives the foreground command inherits its
+	// stdout/stderr. RunCommand must return when the foreground command exits,
+	// not wait for that child to close the output (which would hang forever).
+	start := time.Now()
+	out, code, err := w.RunCommand(ctx, "sleep 60 & echo started")
+	if err != nil {
+		t.Fatalf("RunCommand: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(out, "started") {
+		t.Fatalf("output = %q, want to contain 'started'", out)
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("RunCommand blocked for %s waiting on a background child", elapsed)
 	}
 }

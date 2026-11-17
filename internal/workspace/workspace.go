@@ -337,6 +337,18 @@ func (w *Workspace) RunCommand(ctx context.Context, command string) (string, int
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Capture output to a real file rather than an in-memory writer: os/exec only
+	// waits on its internal copy goroutines when Stdout/Stderr are not *os.File,
+	// and a backgrounded child (e.g. `python -m http.server &`) that inherits those
+	// pipes can keep them open and make cmd.Wait() hang forever — even after the
+	// process group is killed on timeout. A file keeps Wait() bounded by the ctx.
+	outf, err := os.CreateTemp("", "kenosm-run-*.log")
+	if err != nil {
+		return "", -1, err
+	}
+	outName := outf.Name()
+	defer os.Remove(outName)
+
 	cmd := exec.CommandContext(cctx, "bash", "-c", command)
 	cmd.Dir = w.root
 	// Run in its own process group so a timeout kills the whole tree,
@@ -348,19 +360,22 @@ func (w *Workspace) RunCommand(ctx context.Context, command string) (string, int
 		}
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
-	var sb strings.Builder
-	cmd.Stdout = &sb
-	cmd.Stderr = &sb
+	cmd.Stdout = outf
+	cmd.Stderr = outf
 
-	err := cmd.Run()
-	if err != nil {
+	runErr := cmd.Run()
+	_ = outf.Close()
+	raw, _ := os.ReadFile(outName)
+	output := string(raw)
+
+	if runErr != nil {
 		if cctx.Err() == context.DeadlineExceeded {
-			return sb.String(), -1, fmt.Errorf("command timed out after %s", timeout)
+			return output, -1, fmt.Errorf("command timed out after %s", timeout)
 		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			return sb.String(), ee.ExitCode(), nil
+		if ee, ok := runErr.(*exec.ExitError); ok {
+			return output, ee.ExitCode(), nil
 		}
-		return sb.String(), -1, err
+		return output, -1, runErr
 	}
-	return sb.String(), 0, nil
+	return output, 0, nil
 }
