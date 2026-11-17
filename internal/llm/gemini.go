@@ -432,12 +432,39 @@ func toTools(tools []Tool) []toolDecl {
 func parseGenerate(data []byte, statusCode int) (GenerateResult, error) {
 	var gr generateResponse
 	if err := json.Unmarshal(data, &gr); err != nil {
+		// Non-2xx responses often carry a non-JSON body (an HTML error page or a
+		// plain-text 502/503). Keep it as a structured *APIError so the retry and
+		// model-downgrade logic can classify it by status code instead of treating
+		// it as an opaque decode failure.
+		if statusCode >= 400 {
+			msg := strings.Join(strings.Fields(string(data)), " ")
+			if len(msg) > 300 {
+				msg = msg[:300] + "..."
+			}
+			if msg == "" {
+				msg = http.StatusText(statusCode)
+			}
+			return GenerateResult{}, &APIError{
+				StatusCode: statusCode,
+				Code:       statusCode,
+				Status:     http.StatusText(statusCode),
+				Message:    msg,
+			}
+		}
 		return GenerateResult{}, fmt.Errorf("decode gemini response (status %d): %w", statusCode, err)
 	}
 	if gr.Error != nil {
 		return GenerateResult{}, &APIError{StatusCode: statusCode, Code: gr.Error.Code, Status: gr.Error.Status, Message: gr.Error.Message}
 	}
 	if len(gr.Candidates) == 0 {
+		if statusCode >= 400 {
+			return GenerateResult{}, &APIError{
+				StatusCode: statusCode,
+				Code:       statusCode,
+				Status:     http.StatusText(statusCode),
+				Message:    "no candidates in error response",
+			}
+		}
 		return GenerateResult{}, fmt.Errorf("gemini returned no candidates (status %d)", statusCode)
 	}
 

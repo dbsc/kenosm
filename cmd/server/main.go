@@ -61,7 +61,29 @@ func main() {
 	activityRepo := repository.NewActivityRepo(pool)
 
 	transportCache := transport.NewCache()
-	reqLogger := logging.New(ctx, logRepo, logger, 1024)
+	reqLogger := logging.New(logRepo, logger, 1024)
+	defer reqLogger.Close()
+
+	// Periodically prune old request logs so the high-volume table stays bounded.
+	if cfg.LogRetentionDays > 0 {
+		go func() {
+			ticker := time.NewTicker(time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					cutoff := time.Now().Add(-time.Duration(cfg.LogRetentionDays) * 24 * time.Hour)
+					if n, err := logRepo.Prune(ctx, cutoff); err != nil {
+						logger.Error("prune request logs", "err", err)
+					} else if n > 0 {
+						logger.Info("pruned request logs", "rows", n)
+					}
+				}
+			}
+		}()
+	}
 
 	ws, err := workspace.New(cfg.WorkspaceDir, cfg.CommandTimeout)
 	if err != nil {
@@ -89,14 +111,14 @@ func main() {
 
 	admin := handler.NewAdmin(serviceRepo)
 	gateway := handler.NewGateway(serviceRepo, transportCache, reqLogger)
-	swarmHandler := handler.NewSwarm(serviceRepo, usageRepo, chatRepo, cfg.OrchestratorModel, cfg.GeminiModel, cfg.AvailableModels, ws, br, dsk, cfg.Prices, activityRepo)
+	swarmHandler := handler.NewSwarm(serviceRepo, usageRepo, chatRepo, cfg.OrchestratorModel, cfg.GeminiModel, cfg.AvailableModels, ws, br, dsk, cfg.Prices, activityRepo, transportCache, cfg.MaxConcurrentRuns)
 	wsHandler := handler.NewWorkspace(ws)
 	statsHandler := handler.NewStats(usageRepo)
 	activityHandler := handler.NewActivity(activityRepo)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           server.New(admin, gateway, swarmHandler, wsHandler, statsHandler, activityHandler, webui.Handler()),
+		Handler:           server.New(admin, gateway, swarmHandler, wsHandler, statsHandler, activityHandler, webui.Handler(), cfg.APIKey),
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}

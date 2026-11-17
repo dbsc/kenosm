@@ -122,11 +122,16 @@ func (h *Swarm) SendMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
+	if !h.tryAcquireRun() {
+		writeError(w, http.StatusTooManyRequests, "too many concurrent runs")
+		return
+	}
 
 	// Persist the user message; on the first message, also set the title (from
 	// the message text) and remember the mode for the chat.
 	userMsg, err := h.chats.AppendMessage(r.Context(), chatID, "user", text, mode)
 	if err != nil {
+		h.releaseRun()
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

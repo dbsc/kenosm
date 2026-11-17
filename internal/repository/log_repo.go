@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -33,4 +34,14 @@ func (r *LogRepo) InsertRequestLog(ctx context.Context, e model.RequestLog) erro
 		sid, e.RequestID, e.Method, e.Path, e.Status, e.LatencyMS, e.Error,
 	)
 	return err
+}
+
+// Prune deletes request-log rows older than the cutoff and returns how many were
+// removed, keeping the high-volume request_logs table bounded.
+func (r *LogRepo) Prune(ctx context.Context, olderThan time.Time) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM request_logs WHERE created_at < $1`, olderThan)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }

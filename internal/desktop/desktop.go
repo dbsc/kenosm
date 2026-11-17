@@ -39,6 +39,7 @@ type Desktop struct {
 	shot        string
 	ydotool     string
 	ydSocket    string
+	xprop       string // optional: skips compositor frame windows during enumeration
 	timeout     time.Duration
 	layoutDelay time.Duration
 	gs          bool           // gsettings available for layout switching
@@ -74,6 +75,7 @@ func New(cfg Config) (*Desktop, error) {
 		return nil, errors.New("desktop automation requires a screenshot tool (maim, scrot, gnome-screenshot, grim or import)")
 	}
 	d.gs = lookup("gsettings") != ""
+	d.xprop = lookup("xprop")
 	if d.ydotool = lookup("ydotool"); d.ydotool != "" {
 		if d.ydSocket = detectYdSocket(); d.ydSocket == "" {
 			d.ydotool = "" // no ydotoold daemon running
@@ -389,7 +391,10 @@ var wmFrameClasses = []string{
 // isFrame reports whether a window id is a compositor decoration rather than a
 // real application window.
 func (d *Desktop) isFrame(id string) bool {
-	out, err := d.run("xprop", "-id", id, "WM_CLASS")
+	if d.xprop == "" {
+		return false
+	}
+	out, err := d.run(d.xprop, "-id", id, "WM_CLASS")
 	if err != nil {
 		return false
 	}
@@ -404,6 +409,16 @@ func (d *Desktop) isFrame(id string) bool {
 
 // capture produces a PNG screenshot of the screen (target == "") or a window.
 func (d *Desktop) capture(target string) ([]byte, error) {
+	// Focus the target first: scrot (-u) and gnome-screenshot/grim can only grab
+	// the active window or the whole screen, so raising the window makes them
+	// frame the right thing. maim/import address the window id directly and
+	// ignore focus.
+	if target != "" {
+		if _, err := d.run(d.xdotool, "windowactivate", "--sync", target); err == nil {
+			time.Sleep(200 * time.Millisecond) // let the compositor raise and paint the window
+		}
+	}
+
 	tmp, err := os.CreateTemp("", "kenosm-desktop-*.png")
 	if err != nil {
 		return nil, err
@@ -423,16 +438,17 @@ func (d *Desktop) capture(target string) ([]byte, error) {
 		args = append(args, name)
 	case strings.HasPrefix(base, "scrot"):
 		if target != "" {
-			args = append(args, "-u") // scrot captures the active window only
+			args = append(args, "-u") // captures the focused window (we focused the target above)
 		}
 		args = append(args, name)
 	case strings.HasPrefix(base, "gnome-screenshot"):
+		// gnome-screenshot has no non-interactive window capture (-w hangs waiting
+		// for a click), so capture the screen with the target focused instead.
 		args = append(args, "-f", name)
-		if target != "" {
-			args = append(args, "-w")
-		}
 	case strings.HasPrefix(base, "grim"):
-		args = append(args, name) // grim captures the whole output
+		// grim can only grab a whole output; capture the screen with the target
+		// focused (a region would need interactive slurp).
+		args = append(args, name)
 	case strings.HasPrefix(base, "import"):
 		win := target
 		if win == "" {

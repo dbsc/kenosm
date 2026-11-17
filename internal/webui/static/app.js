@@ -16,6 +16,22 @@ $$(".tab").forEach((btn) => {
   });
 });
 
+// Delegated clicks for the dynamically-rendered action buttons. Values live in
+// data-* attributes and are read back through dataset, so agent names, file
+// paths and any other content can never break out into executable script (no
+// inline onclick string interpolation).
+document.addEventListener("click", (ev) => {
+  const el = ev.target.closest("[data-action]");
+  if (!el) return;
+  switch (el.dataset.action) {
+    case "editAgent": editAgent(el.dataset.id); break;
+    case "toggleAgent": toggleAgent(el.dataset.id); break;
+    case "deleteAgent": deleteAgent(el.dataset.id); break;
+    case "removeAttachment": removeAttachment(Number(el.dataset.index)); break;
+    case "viewFile": viewFile(el.dataset.path); break;
+  }
+});
+
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
@@ -33,12 +49,50 @@ function fmtCost(n) {
   return "$" + v.toFixed(4);
 }
 
+// ---------- API auth ----------
+let apiKey = localStorage.getItem("kenosm_key") || "";
+
+// apiFetch injects the bearer key (if any) into every API request and, on a
+// 401, prompts for the key once and retries.
+async function apiFetch(url, opts = {}) {
+  if (!apiKey) apiKey = localStorage.getItem("kenosm_key") || "";
+  const headers = new Headers(opts.headers || {});
+  if (apiKey) headers.set("Authorization", "Bearer " + apiKey);
+  let res = await window.fetch(url, { ...opts, headers });
+  if (res.status === 401) {
+    apiKey = await askForKey();
+    if (apiKey) {
+      headers.set("Authorization", "Bearer " + apiKey);
+      res = await window.fetch(url, { ...opts, headers });
+    }
+  }
+  return res;
+}
+
+function askForKey() {
+  return new Promise((resolve) => {
+    const k = prompt("Enter the API key:");
+    if (k) {
+      localStorage.setItem("kenosm_key", k);
+      apiKey = k;
+    }
+    resolve(k);
+  });
+}
+
+// EventSource cannot set request headers, so the key travels as a query param.
+function eventsUrl(runId) {
+  if (!apiKey) apiKey = localStorage.getItem("kenosm_key") || "";
+  const base = "/api/v1/swarm/run/" + runId + "/events";
+  return apiKey ? base + "?key=" + encodeURIComponent(apiKey) : base;
+}
+
 // ---------- Agents ----------
 let agents = [];
 let editingId = null;
 
 async function loadAgents() {
-  const res = await fetch("/api/v1/services");
+  const res = await apiFetch("/api/v1/services");
   agents = await res.json();
   renderAgents();
 }
@@ -59,9 +113,9 @@ function renderAgents() {
         <div class="sub">model: ${esc(a.model || "auto")} | proxy: ${esc(a.proxy_host)}:${a.proxy_port} | key: ${a.has_api_key ? "set" : "not set"}</div>
       </div>
       <div class="actions">
-        <button class="btn small ghost" onclick="editAgent('${a.id}')">Edit</button>
-        <button class="btn small ghost" onclick="toggleAgent('${a.id}')">${a.enabled ? "Disable" : "Enable"}</button>
-        <button class="btn small ghost" onclick="deleteAgent('${a.id}')">Delete</button>
+        <button class="btn small ghost" data-action="editAgent" data-id="${esc(a.id)}">Edit</button>
+        <button class="btn small ghost" data-action="toggleAgent" data-id="${esc(a.id)}">${a.enabled ? "Disable" : "Enable"}</button>
+        <button class="btn small ghost" data-action="deleteAgent" data-id="${esc(a.id)}">Delete</button>
       </div>
     </div>`
     )
@@ -114,7 +168,7 @@ async function saveAgent() {
 
   const url = editingId ? "/api/v1/services/" + editingId : "/api/v1/services";
   const method = editingId ? "PUT" : "POST";
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -130,7 +184,7 @@ async function saveAgent() {
 
 async function toggleAgent(id) {
   const a = agents.find((x) => x.id === id);
-  await fetch("/api/v1/services/" + id, {
+  await apiFetch("/api/v1/services/" + id, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled: !a.enabled }),
@@ -140,14 +194,14 @@ async function toggleAgent(id) {
 
 async function deleteAgent(id) {
   if (!confirm("Delete this agent?")) return;
-  await fetch("/api/v1/services/" + id, { method: "DELETE" });
+  await apiFetch("/api/v1/services/" + id, { method: "DELETE" });
   loadAgents();
 }
 
 // ---------- Models ----------
 async function loadModels() {
   try {
-    const res = await fetch("/api/v1/models");
+    const res = await apiFetch("/api/v1/models");
     const m = await res.json();
     $("#models-info").innerHTML =
       `orchestrator: <b>${esc(m.orchestrator_model)}</b><br>default: <b>${esc(m.default_model)}</b><br>available: ${esc((m.available_models || []).join(", "))}`;
@@ -188,7 +242,7 @@ function renderAttachments() {
       <span class="chip">
         <img src="data:${esc(a.mime_type)};base64,${esc(a.data)}" alt="" />
         ${esc(a.name)}
-        <button class="chip-x" onclick="removeAttachment(${i})">x</button>
+        <button class="chip-x" data-action="removeAttachment" data-index="${i}">x</button>
       </span>`
     )
     .join("");
@@ -215,7 +269,7 @@ function setMode(mode) {
 
 // ---- chat list ----
 async function loadChats() {
-  const res = await fetch("/api/v1/chats");
+  const res = await apiFetch("/api/v1/chats");
   const data = await res.json();
   chats = data.chats || [];
   renderChatTabs();
@@ -227,7 +281,7 @@ async function loadChats() {
 }
 
 async function newChat() {
-  const res = await fetch("/api/v1/chats", { method: "POST" });
+  const res = await apiFetch("/api/v1/chats", { method: "POST" });
   const c = await res.json();
   chats.push(c);
   currentChatId = c.id;
@@ -259,7 +313,7 @@ function renderChatTabs() {
 }
 
 async function selectChat(id) {
-  const res = await fetch("/api/v1/chats/" + encodeURIComponent(id));
+  const res = await apiFetch("/api/v1/chats/" + encodeURIComponent(id));
   if (!res.ok) return;
   const c = await res.json();
   currentChatId = c.id;
@@ -271,7 +325,7 @@ async function selectChat(id) {
 
 async function deleteChat(id) {
   if (!confirm("Delete this chat?")) return;
-  await fetch("/api/v1/chats/" + encodeURIComponent(id), { method: "DELETE" });
+  await apiFetch("/api/v1/chats/" + encodeURIComponent(id), { method: "DELETE" });
   chats = chats.filter((c) => c.id !== id);
   if (currentChatId === id) currentChatId = null;
   renderChatTabs();
@@ -331,7 +385,7 @@ async function sendMessage() {
   const thinking = addThinkingBubble();
 
   try {
-    const res = await fetch("/api/v1/chats/" + encodeURIComponent(currentChatId) + "/messages", {
+    const res = await apiFetch("/api/v1/chats/" + encodeURIComponent(currentChatId) + "/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, mode: currentMode, images }),
@@ -358,13 +412,13 @@ async function stopRun() {
   if (!currentRunId) return;
   $("#run-status").textContent = "Stopping…";
   try {
-    await fetch("/api/v1/swarm/run/" + currentRunId + "/stop", { method: "POST" });
+    await apiFetch("/api/v1/swarm/run/" + currentRunId + "/stop", { method: "POST" });
   } catch (e) {}
 }
 
 function streamChatRun(runId, thinking) {
   return new Promise((resolve) => {
-    const es = new EventSource("/api/v1/swarm/run/" + runId + "/events");
+    const es = new EventSource(eventsUrl(runId));
     currentES = es;
     const finish = () => {
       es.close();
@@ -405,7 +459,7 @@ function streamChatRun(runId, thinking) {
 
 // ---------- Files ----------
 async function loadFiles() {
-  const res = await fetch("/api/v1/workspace/files");
+  const res = await apiFetch("/api/v1/workspace/files");
   const data = await res.json();
   const files = data.files || [];
   const el = $("#files-list");
@@ -415,13 +469,13 @@ async function loadFiles() {
   }
   el.innerHTML = files
     .map(
-      (f) => `<div class="card"><div class="meta name">${esc(f.path)}</div><div class="actions"><span class="hint">${f.size} bytes</span><button class="btn small ghost" onclick="viewFile('${esc(f.path)}')">View</button></div></div>`
+      (f) => `<div class="card"><div class="meta name">${esc(f.path)}</div><div class="actions"><span class="hint">${f.size} bytes</span><button class="btn small ghost" data-action="viewFile" data-path="${esc(f.path)}">View</button></div></div>`
     )
     .join("");
 }
 
 async function viewFile(path) {
-  const res = await fetch("/api/v1/workspace/files/" + encodeURIComponent(path));
+  const res = await apiFetch("/api/v1/workspace/files/" + encodeURIComponent(path));
   if (!res.ok) return;
   const data = await res.json();
   $("#file-viewer-title").textContent = data.path;
@@ -445,7 +499,7 @@ let lastStats = null;
 
 async function fetchStats() {
   try {
-    const res = await fetch("/api/v1/stats");
+    const res = await apiFetch("/api/v1/stats");
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -621,7 +675,7 @@ async function loadTimeline(runId) {
   const el = $("#timeline");
   el.innerHTML = '<p class="hint">Loading…</p>';
   try {
-    const res = await fetch("/api/v1/runs/" + encodeURIComponent(runId) + "/timeline");
+    const res = await apiFetch("/api/v1/runs/" + encodeURIComponent(runId) + "/timeline");
     if (!res.ok) throw new Error(res.status);
     const data = await res.json();
     renderTimeline(data.timeline || []);

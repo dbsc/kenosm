@@ -17,6 +17,7 @@ import (
 	"kenosm/internal/pricing"
 	"kenosm/internal/repository"
 	"kenosm/internal/swarm"
+	"kenosm/internal/transport"
 	"kenosm/internal/workspace"
 )
 
@@ -38,9 +39,14 @@ type Swarm struct {
 	chats             *repository.ChatRepo
 	prices            pricing.Table
 	activity          *repository.ActivityRepo
+	transportCache    *transport.Cache
+	sem               chan struct{} // bounds concurrent runs (spawning browsers + model calls)
 }
 
-func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo) *Swarm {
+func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo, tc *transport.Cache, maxConcurrent int) *Swarm {
+	if maxConcurrent <= 0 {
+		maxConcurrent = 1
+	}
 	return &Swarm{
 		repo:              repo,
 		usage:             usage,
@@ -54,7 +60,26 @@ func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *
 		chats:             chats,
 		prices:            prices,
 		activity:          activity,
+		transportCache:    tc,
+		sem:               make(chan struct{}, maxConcurrent),
 	}
+}
+
+// tryAcquireRun reserves a slot for a concurrent run, returning false when the
+// server is already at its configured limit. It bounds the number of concurrent
+// agent swarms (each spawning browsers and model calls) and, with the default
+// limit of one, keeps two runs from stomping on the shared workspace.
+func (h *Swarm) tryAcquireRun() bool {
+	select {
+	case h.sem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Swarm) releaseRun() {
+	<-h.sem
 }
 
 // Run starts a background run (defaulting to swarm mode) and returns its run ID
@@ -87,6 +112,10 @@ func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 	agents, err := h.loadAgents(r.Context())
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if !h.tryAcquireRun() {
+		writeError(w, http.StatusTooManyRequests, "too many concurrent runs")
 		return
 	}
 
@@ -129,10 +158,13 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 			e.Cost = h.prices.Cost(e.Model, e.Usage.PromptTokens, e.Usage.CompletionTokens, e.Usage.ThoughtTokens)
 		}
 		state.add(e)
+		// Persist stats/activity off the critical path: a slow database must not
+		// stall the agents between tool calls. e is captured by value, so these
+		// goroutines never race the run.
 		if e.Type == "usage" {
-			h.insertUsage(runID, label, e)
+			go h.insertUsage(runID, label, e)
 		} else if e.Type == "tool" || e.Type == "subtask" || e.Type == "subtask_done" || e.Type == "direct" {
-			h.insertActivity(runID, e)
+			go h.insertActivity(runID, e)
 		}
 	}
 
@@ -145,6 +177,7 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 		Browser:           h.browser,
 		Desktop:           h.desktop,
 		Emitter:           emitter,
+		TransportCache:    h.transportCache,
 	})
 
 	// A fresh context lets the run outlive the HTTP request; its cancel is wired
@@ -154,6 +187,7 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 
 	go func() {
 		defer cancel()
+		defer h.releaseRun()
 		runCtx, cancelRun := context.WithTimeout(ctx, runTimeout)
 		defer cancelRun()
 

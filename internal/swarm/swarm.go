@@ -37,6 +37,7 @@ type Config struct {
 	Browser           *browser.Browser // optional; enables the browser_* tools
 	Desktop           *desktop.Desktop // optional; enables the desktop_* tools
 	Emitter           Emitter          // optional progress-event sink
+	TransportCache    *transport.Cache // optional; reuses pooled SOCKS5 transports across agents/runs
 }
 
 type Swarm struct {
@@ -170,12 +171,14 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	// runnable the moment its prerequisites finish (no wave barrier), and an
 	// agent that finishes early immediately steals the next runnable step — so
 	// all agents stay busy. Blocked work is re-decomposed on demand.
-	subResults, usage := s.execute(ctx, orch, task, plan, contract, assignments, deps, systemExtra, images, agents)
+	subResults, usage := s.execute(ctx, orch, task, plan, contract, assignments, deps, systemExtra, agents)
 	res.Subtasks = subResults
 	res.Usage = append(res.Usage, usage...)
 
-	files, _ := s.cfg.Workspace.ListFiles()
-	res.Files = files
+	if s.cfg.Workspace != nil {
+		files, _ := s.cfg.Workspace.ListFiles()
+		res.Files = files
+	}
 
 	var sb strings.Builder
 	for _, sr := range res.Subtasks {
@@ -247,7 +250,7 @@ func newExecState(nAgents int) *execState {
 // barrier — so an agent that finishes early immediately picks up the next
 // runnable step, and every agent stays busy until the work is done. Blocked work
 // is re-decomposed on demand so idle agents have something to do.
-func (s *Swarm) execute(ctx context.Context, orch *llm.Gemini, task string, plan []string, contract string, assignments map[string]string, deps map[int][]int, systemExtra string, images []llm.Image, agents []Agent) ([]SubtaskResult, []UsageRecord) {
+func (s *Swarm) execute(ctx context.Context, orch *llm.Gemini, task string, plan []string, contract string, assignments map[string]string, deps map[int][]int, systemExtra string, agents []Agent) ([]SubtaskResult, []UsageRecord) {
 	st := newExecState(len(agents))
 	for i, p := range plan {
 		st.jobs[i] = &job{id: i, text: p}
@@ -286,7 +289,7 @@ func (s *Swarm) execute(ctx context.Context, orch *llm.Gemini, task string, plan
 		wg.Add(1)
 		go func(ag Agent) {
 			defer wg.Done()
-			s.worker(ctx, orch, ag, st, task, contract, assignments, systemExtra, images)
+			s.worker(ctx, orch, ag, st, task, contract, assignments, systemExtra)
 		}(a)
 	}
 	wg.Wait()
@@ -307,7 +310,7 @@ func (s *Swarm) execute(ctx context.Context, orch *llm.Gemini, task string, plan
 // worker is one agent's scheduling loop: pull a runnable job, run it, and record
 // the result — or become the re-decomposer when the queue has run dry but work
 // remains, so no agent idles while there is still something to do.
-func (s *Swarm) worker(ctx context.Context, orch *llm.Gemini, ag Agent, st *execState, task, contract string, assignments map[string]string, systemExtra string, images []llm.Image) {
+func (s *Swarm) worker(ctx context.Context, orch *llm.Gemini, ag Agent, st *execState, task, contract string, assignments map[string]string, systemExtra string) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -328,7 +331,11 @@ func (s *Swarm) worker(ctx context.Context, orch *llm.Gemini, ag Agent, st *exec
 
 		s.emit(Event{Time: time.Now(), Type: "subtask", Agent: ag.Name, Model: model, Step: j.id, Wave: round, Detail: truncate(j.text, 140)})
 
-		agRes, usedModel, aerr := s.runWorker(ctx, ag, model, systemExtra, []llm.Turn{{Role: "user", Text: prompt, Images: images}})
+		// Workers get a text-only prompt: the raw images are sent to the
+		// orchestrator alone (for planning), and image-derived requirements reach
+		// workers through the plan/contract. Re-attaching the base64 images here
+		// would duplicate their token cost across every agent.
+		agRes, usedModel, aerr := s.runWorker(ctx, ag, model, systemExtra, []llm.Turn{{Role: "user", Text: prompt}})
 
 		sr := SubtaskResult{Task: j.text, Agent: ag.Name, Model: usedModel, Files: agRes.Files}
 		if aerr != nil {
@@ -764,13 +771,21 @@ func formatHistory(history []llm.Turn) string {
 }
 
 func (s *Swarm) buildClient(a Agent, model string) (*llm.Gemini, error) {
-	return llm.New(llm.Config{
+	cfg := llm.Config{
 		BaseURL:        a.BaseURL,
 		APIKey:         a.APIKey,
 		Model:          model,
 		FallbackModels: downgradeFallbacks(model, s.cfg.AvailableModels),
 		Proxy:          a.Proxy,
-	})
+	}
+	if s.cfg.TransportCache != nil {
+		tr, err := s.cfg.TransportCache.Get(a.Proxy)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Transport = tr
+	}
+	return llm.New(cfg)
 }
 
 // downgradeFallbacks orders the available models so that, when the primary is

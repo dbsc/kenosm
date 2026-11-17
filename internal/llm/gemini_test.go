@@ -186,3 +186,61 @@ func TestIsDowngradeTrigger(t *testing.T) {
 		}
 	}
 }
+
+func TestParseGenerateNonJSONError(t *testing.T) {
+	_, err := parseGenerate([]byte("<html>bad gateway</html>"), http.StatusBadGateway)
+	ae, ok := err.(*APIError)
+	if !ok {
+		t.Fatalf("err = %v (%T), want *APIError", err, err)
+	}
+	if ae.StatusCode != http.StatusBadGateway || ae.Code != http.StatusBadGateway {
+		t.Fatalf("status/code = %d/%d, want 502/502", ae.StatusCode, ae.Code)
+	}
+	if ae.Status != "Bad Gateway" {
+		t.Fatalf("status = %q, want \"Bad Gateway\"", ae.Status)
+	}
+}
+
+func TestGenerateDowngradesOnNonJSONErrorBody(t *testing.T) {
+	var primaryHits, liteHits atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "gemini-3.5-flash:") {
+			primaryHits.Add(1)
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("<html><body>Service Unavailable</body></html>"))
+			return
+		}
+		liteHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(okBody))
+	}))
+	defer srv.Close()
+
+	g, err := New(Config{
+		BaseURL:        srv.URL,
+		APIKey:         "test-key",
+		Model:          "gemini-3.5-flash",
+		FallbackModels: []string{"gemini-3.5-flash-lite"},
+		Transport:      srv.Client().Transport,
+		MaxRetries:     1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	res, err := g.Generate(context.Background(), "sys", []Turn{{Role: "user", Text: "hi"}}, nil)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if res.Text != "hello" {
+		t.Fatalf("text = %q, want hello", res.Text)
+	}
+	if primaryHits.Load() != 1 {
+		t.Fatalf("primary hits = %d, want 1", primaryHits.Load())
+	}
+	if liteHits.Load() != 1 {
+		t.Fatalf("lite hits = %d, want 1 (503 with non-JSON body must downgrade)", liteHits.Load())
+	}
+}

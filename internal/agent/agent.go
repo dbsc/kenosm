@@ -21,6 +21,9 @@ type Config struct {
 	Browser       *browser.Browser // optional; enables the browser_* tools
 	Desktop       *desktop.Desktop // optional; enables the desktop_* tools
 	MaxIterations int
+	// DisabledTools lists tool names to exclude from the agent, even when their
+	// module is otherwise available. Empty = enable every available tool.
+	DisabledTools []string
 	Log           func(kind, tool, detail string) // optional progress callback; tool is the tool name for tool events
 	OnUsage       func(llm.Usage)                 // optional: fired after each model call with its token usage
 	SystemExtra   string                          // optional: appended to the agent's system prompt (e.g. a shared contract)
@@ -35,6 +38,20 @@ type Result struct {
 	Usage      llm.Usage `json:"usage"`
 }
 
+// Tool is a single callable tool the agent can expose to the model: the schema
+// the model sees (def) plus the handler that runs it. Related tools are grouped
+// into modules (files, shell, browser, desktop), so each tool is an independent,
+// toggleable unit.
+type Tool struct {
+	def llm.Tool
+	run func(a *Agent, ctx context.Context, c llm.FunctionCall) llm.FunctionResponse
+}
+
+// tool is a small constructor that keeps the module definitions terse.
+func tool(name, description string, params map[string]any, run func(*Agent, context.Context, llm.FunctionCall) llm.FunctionResponse) Tool {
+	return Tool{def: llm.Tool{Name: name, Description: description, Parameters: params}, run: run}
+}
+
 // Agent is a tool-using loop: it repeatedly asks the model, executes any tool
 // calls (write files, read files, list files, run commands, drive a browser,
 // control the desktop), and feeds results back until the model finishes.
@@ -46,7 +63,7 @@ type Agent struct {
 	session     *browser.Session
 	runCtx      context.Context
 	maxIt       int
-	tools       []llm.Tool
+	tools       []Tool
 	log         func(kind, tool, detail string)
 	onUsage     func(llm.Usage)
 	systemExtra string
@@ -58,13 +75,33 @@ func New(cfg Config) *Agent {
 	if maxIt <= 0 {
 		maxIt = 15
 	}
-	tools := buildTools()
-	if cfg.Browser == nil {
-		tools = withoutPrefix(tools, "browser_")
+
+	disabled := make(map[string]bool, len(cfg.DisabledTools))
+	for _, n := range cfg.DisabledTools {
+		disabled[strings.TrimSpace(n)] = true
 	}
-	if cfg.Desktop == nil {
-		tools = withoutPrefix(tools, "desktop_")
+
+	var tools []Tool
+	addModule := func(enabled bool, defs []Tool) {
+		if !enabled {
+			return
+		}
+		for _, t := range defs {
+			if disabled[t.def.Name] {
+				continue
+			}
+			tools = append(tools, t)
+		}
 	}
+
+	// File and shell tools are always available; browser/desktop modules enable
+	// only when the respective runtime is present. Individual tools can still be
+	// turned off via Config.DisabledTools.
+	addModule(true, fileTools())
+	addModule(true, shellTools())
+	addModule(cfg.Browser != nil, browserTools())
+	addModule(cfg.Desktop != nil, desktopTools())
+
 	return &Agent{llm: cfg.LLM, ws: cfg.Workspace, browser: cfg.Browser, desktop: cfg.Desktop, maxIt: maxIt, tools: tools, log: cfg.Log, onUsage: cfg.OnUsage, systemExtra: cfg.SystemExtra}
 }
 
@@ -86,6 +123,11 @@ func (a *Agent) RunWithHistory(ctx context.Context, history []llm.Turn) (Result,
 
 	system := a.systemPrompt()
 
+	defs := make([]llm.Tool, 0, len(a.tools))
+	for _, t := range a.tools {
+		defs = append(defs, t.def)
+	}
+
 	var summary strings.Builder
 	var callLog []string
 	var usage llm.Usage
@@ -98,7 +140,7 @@ func (a *Agent) RunWithHistory(ctx context.Context, history []llm.Turn) (Result,
 		if a.log != nil {
 			a.log("model", "", "generating response")
 		}
-		res, err := a.llm.Generate(ctx, system, history, a.tools)
+		res, err := a.llm.Generate(ctx, system, history, defs)
 		if err != nil {
 			return Result{}, err
 		}
@@ -213,224 +255,20 @@ func toolSignature(calls []llm.FunctionCall) string {
 	return b.String()
 }
 
+// execute dispatches a tool call to the matching tool's handler.
 func (a *Agent) execute(ctx context.Context, c llm.FunctionCall) llm.FunctionResponse {
-	resp := func(m map[string]any) llm.FunctionResponse {
-		return llm.FunctionResponse{Name: c.Name, Response: m, ID: c.ID, ThoughtSignature: c.ThoughtSignature}
+	for _, t := range a.tools {
+		if t.def.Name == c.Name {
+			return t.run(a, ctx, c)
+		}
 	}
-	switch c.Name {
-	case "write_file":
-		path := cleanRelPath(c.Args["path"])
-		content, _ := c.Args["content"].(string)
-		if err := a.ws.WriteFile(path, content); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		a.noteFile(path)
-		return resp(map[string]any{"ok": true, "path": path})
-	case "read_file":
-		path := cleanRelPath(c.Args["path"])
-		data, err := a.ws.ReadFile(path)
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return resp(map[string]any{"content": data})
-	case "list_files":
-		files, err := a.ws.ListFiles()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		names := make([]string, 0, len(files))
-		for _, f := range files {
-			names = append(names, f.Path)
-		}
-		return resp(map[string]any{"files": names})
-	case "run_command":
-		command, _ := c.Args["command"].(string)
-		out, code, err := a.ws.RunCommand(ctx, command)
-		m := map[string]any{"output": out, "exit_code": code}
-		if err != nil {
-			m["error"] = err.Error()
-		}
-		return resp(m)
-	case "edit_file":
-		path := cleanRelPath(c.Args["path"])
-		oldS, _ := c.Args["old_string"].(string)
-		newS, _ := c.Args["new_string"].(string)
-		if path == "" || oldS == "" {
-			return resp(map[string]any{"error": "edit_file requires path and old_string"})
-		}
-		n, err := a.ws.EditFile(path, oldS, newS)
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		a.noteFile(path)
-		return resp(map[string]any{"ok": true, "path": path, "replaced": n})
-	case "search_files":
-		query, _ := c.Args["query"].(string)
-		if query == "" {
-			return resp(map[string]any{"error": "search_files requires a query"})
-		}
-		matches, err := a.ws.Search(query)
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return resp(map[string]any{"matches": matches, "count": len(matches)})
+	return a.resp(c, map[string]any{"error": "unknown tool: " + c.Name})
+}
 
-	// ---- browser tools ----
-	case "browser_navigate":
-		target := strVal(c.Args["url"])
-		if target == "" {
-			return resp(map[string]any{"error": "browser_navigate requires a url"})
-		}
-		s, err := a.bsession()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		if err := s.Navigate(a.resolveTarget(target)); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.shotResp(c, s, map[string]any{"ok": true, "url": target})
-	case "browser_snapshot":
-		s, err := a.bsession()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		els, err := s.Snapshot()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return resp(map[string]any{"elements": els, "count": len(els)})
-	case "browser_click":
-		target := browser.SelectorFor(strVal(c.Args["target"]))
-		if target == "" {
-			return resp(map[string]any{"error": "browser_click requires a target (index from browser_snapshot, or a CSS selector)"})
-		}
-		s, err := a.bsession()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		if err := s.Click(target); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.shotResp(c, s, map[string]any{"ok": true, "clicked": target})
-	case "browser_type":
-		target := browser.SelectorFor(strVal(c.Args["target"]))
-		text := strVal(c.Args["text"])
-		if target == "" {
-			return resp(map[string]any{"error": "browser_type requires a target"})
-		}
-		s, err := a.bsession()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		if err := s.Type(target, text); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.shotResp(c, s, map[string]any{"ok": true, "typed_into": target})
-	case "browser_scroll":
-		amount := intVal(c.Args["amount"], 600)
-		if strings.EqualFold(strVal(c.Args["direction"]), "up") {
-			amount = -amount
-		}
-		s, err := a.bsession()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		if err := s.Scroll(amount); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.shotResp(c, s, map[string]any{"ok": true, "scrolled_by": amount})
-	case "browser_screenshot":
-		s, err := a.bsession()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.shotResp(c, s, map[string]any{"ok": true})
-	case "browser_text":
-		s, err := a.bsession()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		text, err := s.Text()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return resp(map[string]any{"text": text})
-
-	// ---- desktop tools ----
-	case "desktop_launch":
-		program := strings.TrimSpace(strVal(c.Args["program"]))
-		if program == "" {
-			return resp(map[string]any{"error": "desktop_launch requires a program"})
-		}
-		pid, err := a.desktop.Launch(program, strSlice(c.Args["args"]), strVal(c.Args["workdir"]))
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.deskShotResp(c, map[string]any{"ok": true, "pid": pid, "program": program})
-	case "desktop_windows":
-		wins, err := a.desktop.Windows()
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return resp(map[string]any{"windows": wins, "count": len(wins)})
-	case "desktop_focus":
-		target := strVal(c.Args["target"])
-		if target == "" {
-			return resp(map[string]any{"error": "desktop_focus requires a target (window id or title substring)"})
-		}
-		if err := a.desktop.Focus(target); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		id, title, _ := a.desktop.ActiveWindow()
-		return a.deskShotResp(c, map[string]any{"ok": true, "focused_id": id, "focused_title": title})
-	case "desktop_screenshot":
-		var img []byte
-		var err error
-		if target := strVal(c.Args["window"]); target != "" {
-			img, err = a.desktop.ScreenshotWindow(target)
-		} else {
-			img, err = a.desktop.Screenshot()
-		}
-		if err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.imageResp(c, img, map[string]any{"ok": true})
-	case "desktop_move":
-		x, y := intVal(c.Args["x"], 0), intVal(c.Args["y"], 0)
-		if err := a.desktop.MouseMove(x, y); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return resp(map[string]any{"ok": true, "moved_to": []int{x, y}})
-	case "desktop_click":
-		x, y := intVal(c.Args["x"], 0), intVal(c.Args["y"], 0)
-		if err := a.desktop.Click(x, y, strVal(c.Args["button"])); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.deskShotResp(c, map[string]any{"ok": true, "clicked": []int{x, y}})
-	case "desktop_type":
-		text := strVal(c.Args["text"])
-		if err := a.desktop.Type(text); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.deskShotResp(c, map[string]any{"ok": true, "typed": text})
-	case "desktop_key":
-		key := strVal(c.Args["key"])
-		if key == "" {
-			return resp(map[string]any{"error": "desktop_key requires a key"})
-		}
-		if err := a.desktop.Key(key); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.deskShotResp(c, map[string]any{"ok": true, "pressed": key})
-	case "desktop_scroll":
-		amount := intVal(c.Args["amount"], 1)
-		if err := a.desktop.Scroll(strVal(c.Args["direction"]), amount); err != nil {
-			return resp(map[string]any{"error": err.Error()})
-		}
-		return a.deskShotResp(c, map[string]any{"ok": true, "scrolled": amount})
-	default:
-		return resp(map[string]any{"error": "unknown tool: " + c.Name})
-	}
+// resp builds a function response carrying the tool call's id and thought
+// signature so the model can correlate it.
+func (a *Agent) resp(c llm.FunctionCall, m map[string]any) llm.FunctionResponse {
+	return llm.FunctionResponse{Name: c.Name, Response: m, ID: c.ID, ThoughtSignature: c.ThoughtSignature}
 }
 
 // bsession returns the run's shared browser session, creating it on first use.
@@ -454,7 +292,7 @@ func (a *Agent) bsession() (*browser.Session, error) {
 func (a *Agent) shotResp(c llm.FunctionCall, s *browser.Session, meta map[string]any) llm.FunctionResponse {
 	img, err := s.Screenshot()
 	if err != nil {
-		return llm.FunctionResponse{Name: c.Name, Response: map[string]any{"error": err.Error()}, ID: c.ID, ThoughtSignature: c.ThoughtSignature}
+		return a.resp(c, map[string]any{"error": err.Error()})
 	}
 	return a.imageResp(c, img, meta)
 }
@@ -463,7 +301,7 @@ func (a *Agent) shotResp(c llm.FunctionCall, s *browser.Session, meta map[string
 func (a *Agent) deskShotResp(c llm.FunctionCall, meta map[string]any) llm.FunctionResponse {
 	img, err := a.desktop.Screenshot()
 	if err != nil {
-		return llm.FunctionResponse{Name: c.Name, Response: map[string]any{"error": err.Error()}, ID: c.ID, ThoughtSignature: c.ThoughtSignature}
+		return a.resp(c, map[string]any{"error": err.Error()})
 	}
 	return a.imageResp(c, img, meta)
 }
@@ -472,7 +310,7 @@ func (a *Agent) deskShotResp(c llm.FunctionCall, meta map[string]any) llm.Functi
 func (a *Agent) imageResp(c llm.FunctionCall, img []byte, meta map[string]any) llm.FunctionResponse {
 	path := fmt.Sprintf("screenshots/shot-%d.png", time.Now().UnixNano())
 	if werr := a.ws.WriteFile(path, string(img)); werr != nil {
-		return llm.FunctionResponse{Name: c.Name, Response: map[string]any{"error": "save screenshot: " + werr.Error()}, ID: c.ID, ThoughtSignature: c.ThoughtSignature}
+		return a.resp(c, map[string]any{"error": "save screenshot: " + werr.Error()})
 	}
 	a.noteFile(path)
 	meta["screenshot"] = path
@@ -596,12 +434,11 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-func buildTools() []llm.Tool {
-	return []llm.Tool{
-		{
-			Name:        "write_file",
-			Description: "Create or overwrite a file in the workspace.",
-			Parameters: map[string]any{
+// fileTools returns the workspace file tools (always available).
+func fileTools() []Tool {
+	return []Tool{
+		tool("write_file", "Create or overwrite a file in the workspace.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"path":    map[string]any{"type": "STRING", "description": "Relative file path inside the workspace (do NOT prefix with 'workspace/')"},
@@ -609,41 +446,46 @@ func buildTools() []llm.Tool {
 				},
 				"required": []any{"path", "content"},
 			},
-		},
-		{
-			Name:        "read_file",
-			Description: "Read the content of a file in the workspace.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				path := cleanRelPath(c.Args["path"])
+				content, _ := c.Args["content"].(string)
+				if err := a.ws.WriteFile(path, content); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				a.noteFile(path)
+				return a.resp(c, map[string]any{"ok": true, "path": path})
+			}),
+		tool("read_file", "Read the content of a file in the workspace.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"path": map[string]any{"type": "STRING", "description": "Relative file path inside the workspace (do NOT prefix with 'workspace/')"},
 				},
 				"required": []any{"path"},
 			},
-		},
-		{
-			Name:        "list_files",
-			Description: "List all files in the workspace.",
-			Parameters: map[string]any{
-				"type":       "OBJECT",
-				"properties": map[string]any{},
-			},
-		},
-		{
-			Name:        "run_command",
-			Description: "Run a shell command inside the workspace directory and return stdout/stderr and exit code. Use it to test your work.",
-			Parameters: map[string]any{
-				"type": "OBJECT",
-				"properties": map[string]any{
-					"command": map[string]any{"type": "STRING", "description": "Shell command to run"},
-				},
-				"required": []any{"command"},
-			},
-		},
-		{
-			Name:        "edit_file",
-			Description: "Replace a substring inside a file with new text, without rewriting the whole file. Use it for targeted fixes. Returns how many replacements were made.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				path := cleanRelPath(c.Args["path"])
+				data, err := a.ws.ReadFile(path)
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.resp(c, map[string]any{"content": data})
+			}),
+		tool("list_files", "List all files in the workspace.",
+			map[string]any{"type": "OBJECT", "properties": map[string]any{}},
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				files, err := a.ws.ListFiles()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				names := make([]string, 0, len(files))
+				for _, f := range files {
+					names = append(names, f.Path)
+				}
+				return a.resp(c, map[string]any{"files": names})
+			}),
+		tool("edit_file", "Replace a substring inside a file with new text, without rewriting the whole file. Use it for targeted fixes. Returns how many replacements were made.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"path":       map[string]any{"type": "STRING", "description": "File path inside the workspace (do NOT prefix with 'workspace/')"},
@@ -652,52 +494,127 @@ func buildTools() []llm.Tool {
 				},
 				"required": []any{"path", "old_string", "new_string"},
 			},
-		},
-		{
-			Name:        "search_files",
-			Description: "Search all files in the workspace for a text query (case-insensitive) and return matching lines as 'path:line: text'.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				path := cleanRelPath(c.Args["path"])
+				oldS, _ := c.Args["old_string"].(string)
+				newS, _ := c.Args["new_string"].(string)
+				if path == "" || oldS == "" {
+					return a.resp(c, map[string]any{"error": "edit_file requires path and old_string"})
+				}
+				n, err := a.ws.EditFile(path, oldS, newS)
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				a.noteFile(path)
+				return a.resp(c, map[string]any{"ok": true, "path": path, "replaced": n})
+			}),
+		tool("search_files", "Search all files in the workspace for a text query (case-insensitive) and return matching lines as 'path:line: text'.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"query": map[string]any{"type": "STRING", "description": "Text to search for"},
 				},
 				"required": []any{"query"},
 			},
-		},
-		{
-			Name:        "browser_navigate",
-			Description: "Open a URL (or a workspace-relative file path) in the browser. Returns a screenshot of the loaded page.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				query, _ := c.Args["query"].(string)
+				if query == "" {
+					return a.resp(c, map[string]any{"error": "search_files requires a query"})
+				}
+				matches, err := a.ws.Search(query)
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.resp(c, map[string]any{"matches": matches, "count": len(matches)})
+			}),
+	}
+}
+
+// shellTools returns the command-running tool (always available).
+func shellTools() []Tool {
+	return []Tool{
+		tool("run_command", "Run a shell command inside the workspace directory and return stdout/stderr and exit code. Use it to test your work.",
+			map[string]any{
+				"type": "OBJECT",
+				"properties": map[string]any{
+					"command": map[string]any{"type": "STRING", "description": "Shell command to run"},
+				},
+				"required": []any{"command"},
+			},
+			func(a *Agent, ctx context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				command, _ := c.Args["command"].(string)
+				out, code, err := a.ws.RunCommand(ctx, command)
+				m := map[string]any{"output": out, "exit_code": code}
+				if err != nil {
+					m["error"] = err.Error()
+				}
+				return a.resp(c, m)
+			}),
+	}
+}
+
+// browserTools returns the browser tools (enabled when a Browser is available).
+func browserTools() []Tool {
+	return []Tool{
+		tool("browser_navigate", "Open a URL (or a workspace-relative file path) in the browser. Returns a screenshot of the loaded page.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"url": map[string]any{"type": "STRING", "description": "http(s) URL to open, or a local file path inside the workspace"},
 				},
 				"required": []any{"url"},
 			},
-		},
-		{
-			Name:        "browser_snapshot",
-			Description: "List the visible interactive elements on the current page (buttons, links, inputs) as numbered entries. Use the numbers as targets for browser_click / browser_type.",
-			Parameters: map[string]any{
-				"type":       "OBJECT",
-				"properties": map[string]any{},
-			},
-		},
-		{
-			Name:        "browser_click",
-			Description: "Click an element on the page: pass its index from browser_snapshot (e.g. \"3\") or a CSS selector (e.g. \"#submit\"). Returns a screenshot taken right after the click.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				target := strVal(c.Args["url"])
+				if target == "" {
+					return a.resp(c, map[string]any{"error": "browser_navigate requires a url"})
+				}
+				s, err := a.bsession()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				if err := s.Navigate(a.resolveTarget(target)); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.shotResp(c, s, map[string]any{"ok": true, "url": target})
+			}),
+		tool("browser_snapshot", "List the visible interactive elements on the current page (buttons, links, inputs) as numbered entries. Use the numbers as targets for browser_click / browser_type.",
+			map[string]any{"type": "OBJECT", "properties": map[string]any{}},
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				s, err := a.bsession()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				els, err := s.Snapshot()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.resp(c, map[string]any{"elements": els, "count": len(els)})
+			}),
+		tool("browser_click", "Click an element on the page: pass its index from browser_snapshot (e.g. \"3\") or a CSS selector (e.g. \"#submit\"). Returns a screenshot taken right after the click.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"target": map[string]any{"type": "STRING", "description": "Element index from browser_snapshot, or a CSS selector"},
 				},
 				"required": []any{"target"},
 			},
-		},
-		{
-			Name:        "browser_type",
-			Description: "Type text into an input/textarea/field: pass its index from browser_snapshot or a CSS selector. Returns a screenshot after typing.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				target := browser.SelectorFor(strVal(c.Args["target"]))
+				if target == "" {
+					return a.resp(c, map[string]any{"error": "browser_click requires a target (index from browser_snapshot, or a CSS selector)"})
+				}
+				s, err := a.bsession()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				if err := s.Click(target); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.shotResp(c, s, map[string]any{"ok": true, "clicked": target})
+			}),
+		tool("browser_type", "Type text into an input/textarea/field: pass its index from browser_snapshot or a CSS selector. Returns a screenshot after typing.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"target": map[string]any{"type": "STRING", "description": "Element index from browser_snapshot, or a CSS selector"},
@@ -705,11 +622,23 @@ func buildTools() []llm.Tool {
 				},
 				"required": []any{"target", "text"},
 			},
-		},
-		{
-			Name:        "browser_scroll",
-			Description: "Scroll the page up or down. Returns a screenshot of the new viewport so you can verify scrolled content.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				target := browser.SelectorFor(strVal(c.Args["target"]))
+				text := strVal(c.Args["text"])
+				if target == "" {
+					return a.resp(c, map[string]any{"error": "browser_type requires a target"})
+				}
+				s, err := a.bsession()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				if err := s.Type(target, text); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.shotResp(c, s, map[string]any{"ok": true, "typed_into": target})
+			}),
+		tool("browser_scroll", "Scroll the page up or down. Returns a screenshot of the new viewport so you can verify scrolled content.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"direction": map[string]any{"type": "STRING", "description": "\"down\" or \"up\""},
@@ -717,27 +646,50 @@ func buildTools() []llm.Tool {
 				},
 				"required": []any{"direction"},
 			},
-		},
-		{
-			Name:        "browser_screenshot",
-			Description: "Capture a screenshot of the current browser viewport.",
-			Parameters: map[string]any{
-				"type":       "OBJECT",
-				"properties": map[string]any{},
-			},
-		},
-		{
-			Name:        "browser_text",
-			Description: "Return the visible text of the current page.",
-			Parameters: map[string]any{
-				"type":       "OBJECT",
-				"properties": map[string]any{},
-			},
-		},
-		{
-			Name:        "desktop_launch",
-			Description: "Launch a program on the desktop (detached). Returns the PID and a screenshot.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				amount := intVal(c.Args["amount"], 600)
+				if strings.EqualFold(strVal(c.Args["direction"]), "up") {
+					amount = -amount
+				}
+				s, err := a.bsession()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				if err := s.Scroll(amount); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.shotResp(c, s, map[string]any{"ok": true, "scrolled_by": amount})
+			}),
+		tool("browser_screenshot", "Capture a screenshot of the current browser viewport.",
+			map[string]any{"type": "OBJECT", "properties": map[string]any{}},
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				s, err := a.bsession()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.shotResp(c, s, map[string]any{"ok": true})
+			}),
+		tool("browser_text", "Return the visible text of the current page.",
+			map[string]any{"type": "OBJECT", "properties": map[string]any{}},
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				s, err := a.bsession()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				text, err := s.Text()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.resp(c, map[string]any{"text": text})
+			}),
+	}
+}
+
+// desktopTools returns the desktop tools (enabled when a Desktop is available).
+func desktopTools() []Tool {
+	return []Tool{
+		tool("desktop_launch", "Launch a program on the desktop (detached). Returns the PID and a screenshot.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"program": map[string]any{"type": "STRING", "description": "Program name or path, e.g. \"xterm\" or \"/usr/bin/firefox\""},
@@ -746,40 +698,67 @@ func buildTools() []llm.Tool {
 				},
 				"required": []any{"program"},
 			},
-		},
-		{
-			Name:        "desktop_windows",
-			Description: "List visible desktop windows (id + title) so you can pick one to focus or screenshot.",
-			Parameters: map[string]any{
-				"type":       "OBJECT",
-				"properties": map[string]any{},
-			},
-		},
-		{
-			Name:        "desktop_focus",
-			Description: "Raise and focus a window by its numeric id or a title substring. Returns a screenshot.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				program := strings.TrimSpace(strVal(c.Args["program"]))
+				if program == "" {
+					return a.resp(c, map[string]any{"error": "desktop_launch requires a program"})
+				}
+				pid, err := a.desktop.Launch(program, strSlice(c.Args["args"]), strVal(c.Args["workdir"]))
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.deskShotResp(c, map[string]any{"ok": true, "pid": pid, "program": program})
+			}),
+		tool("desktop_windows", "List visible desktop windows (id + title) so you can pick one to focus or screenshot.",
+			map[string]any{"type": "OBJECT", "properties": map[string]any{}},
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				wins, err := a.desktop.Windows()
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.resp(c, map[string]any{"windows": wins, "count": len(wins)})
+			}),
+		tool("desktop_focus", "Raise and focus a window by its numeric id or a title substring. Returns a screenshot.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"target": map[string]any{"type": "STRING", "description": "Window id or title substring"},
 				},
 				"required": []any{"target"},
 			},
-		},
-		{
-			Name:        "desktop_screenshot",
-			Description: "Capture a screenshot of the whole screen, or of a specific window if 'window' (id or title) is given.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				target := strVal(c.Args["target"])
+				if target == "" {
+					return a.resp(c, map[string]any{"error": "desktop_focus requires a target (window id or title substring)"})
+				}
+				if err := a.desktop.Focus(target); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				id, title, _ := a.desktop.ActiveWindow()
+				return a.deskShotResp(c, map[string]any{"ok": true, "focused_id": id, "focused_title": title})
+			}),
+		tool("desktop_screenshot", "Capture a screenshot of the whole screen, or of a specific window if 'window' (id or title) is given.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"window": map[string]any{"type": "STRING", "description": "Window id or title substring (optional; default is the whole screen)"},
 				},
 			},
-		},
-		{
-			Name:        "desktop_move",
-			Description: "Move the mouse pointer to absolute screen coordinates (x, y in pixels).",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				var img []byte
+				var err error
+				if target := strVal(c.Args["window"]); target != "" {
+					img, err = a.desktop.ScreenshotWindow(target)
+				} else {
+					img, err = a.desktop.Screenshot()
+				}
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.imageResp(c, img, map[string]any{"ok": true})
+			}),
+		tool("desktop_move", "Move the mouse pointer to absolute screen coordinates (x, y in pixels).",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"x": map[string]any{"type": "NUMBER", "description": "X coordinate"},
@@ -787,11 +766,15 @@ func buildTools() []llm.Tool {
 				},
 				"required": []any{"x", "y"},
 			},
-		},
-		{
-			Name:        "desktop_click",
-			Description: "Move the mouse to (x, y) and click. Button is \"left\", \"middle\" or \"right\". Returns a screenshot after the click.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				x, y := intVal(c.Args["x"], 0), intVal(c.Args["y"], 0)
+				if err := a.desktop.MouseMove(x, y); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.resp(c, map[string]any{"ok": true, "moved_to": []int{x, y}})
+			}),
+		tool("desktop_click", "Move the mouse to (x, y) and click. Button is \"left\", \"middle\" or \"right\". Returns a screenshot after the click.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"x":      map[string]any{"type": "NUMBER", "description": "X coordinate"},
@@ -800,33 +783,48 @@ func buildTools() []llm.Tool {
 				},
 				"required": []any{"x", "y"},
 			},
-		},
-		{
-			Name:        "desktop_type",
-			Description: "Type text into the currently focused window. Returns a screenshot after typing.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				x, y := intVal(c.Args["x"], 0), intVal(c.Args["y"], 0)
+				if err := a.desktop.Click(x, y, strVal(c.Args["button"])); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.deskShotResp(c, map[string]any{"ok": true, "clicked": []int{x, y}})
+			}),
+		tool("desktop_type", "Type text into the currently focused window. Returns a screenshot after typing.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"text": map[string]any{"type": "STRING", "description": "Text to type"},
 				},
 				"required": []any{"text"},
 			},
-		},
-		{
-			Name:        "desktop_key",
-			Description: "Press a key or key combination in the focused window, e.g. \"Return\", \"Escape\", \"ctrl+c\", \"alt+Tab\". Returns a screenshot.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				text := strVal(c.Args["text"])
+				if err := a.desktop.Type(text); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.deskShotResp(c, map[string]any{"ok": true, "typed": text})
+			}),
+		tool("desktop_key", "Press a key or key combination in the focused window, e.g. \"Return\", \"Escape\", \"ctrl+c\", \"alt+Tab\". Returns a screenshot.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"key": map[string]any{"type": "STRING", "description": "Key or combination"},
 				},
 				"required": []any{"key"},
 			},
-		},
-		{
-			Name:        "desktop_scroll",
-			Description: "Scroll the mouse wheel up or down at the current pointer position. Returns a screenshot.",
-			Parameters: map[string]any{
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				key := strVal(c.Args["key"])
+				if key == "" {
+					return a.resp(c, map[string]any{"error": "desktop_key requires a key"})
+				}
+				if err := a.desktop.Key(key); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.deskShotResp(c, map[string]any{"ok": true, "pressed": key})
+			}),
+		tool("desktop_scroll", "Scroll the mouse wheel up or down at the current pointer position. Returns a screenshot.",
+			map[string]any{
 				"type": "OBJECT",
 				"properties": map[string]any{
 					"direction": map[string]any{"type": "STRING", "description": "\"up\" or \"down\""},
@@ -834,19 +832,12 @@ func buildTools() []llm.Tool {
 				},
 				"required": []any{"direction"},
 			},
-		},
+			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
+				amount := intVal(c.Args["amount"], 1)
+				if err := a.desktop.Scroll(strVal(c.Args["direction"]), amount); err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				return a.deskShotResp(c, map[string]any{"ok": true, "scrolled": amount})
+			}),
 	}
-}
-
-// withoutPrefix returns a copy of tools with any tool whose name has the given
-// prefix removed.
-func withoutPrefix(tools []llm.Tool, prefix string) []llm.Tool {
-	out := make([]llm.Tool, 0, len(tools))
-	for _, t := range tools {
-		if strings.HasPrefix(t.Name, prefix) {
-			continue
-		}
-		out = append(out, t)
-	}
-	return out
 }
