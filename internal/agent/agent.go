@@ -19,8 +19,8 @@ import (
 type Config struct {
 	LLM           llm.Client
 	Workspace     *workspace.Workspace
-	Browser       *browser.Browser // optional; enables the browser_* tools
-	Desktop       *desktop.Desktop // optional; enables the desktop_* tools
+	Browser       *browser.Browser    // optional; enables the browser_* tools
+	Desktop       *desktop.Desktop    // optional; enables the desktop_* tools
 	Proxy         transport.ProxySpec // optional; the agent's own SOCKS5 proxy (per-agent browser)
 	MaxIterations int
 	// DisabledTools lists tool names to exclude from the agent, even when their
@@ -278,6 +278,7 @@ When you create or change files, actually test them with the run_command tool be
 	}
 	if hasBrowser {
 		b.WriteString(`
+When you build a web page or any UI, make it genuinely polished, not plain: use a real colour palette and Google Fonts, gradients or an aurora/mesh background, glassmorphism (backdrop-filter blur), CSS 3D transforms (perspective + rotateX/rotateY) for depth, and subtle motion. A design asset library lives in the assets/ directory — read assets/README.md first. It contains ~7500 SVG icons (assets/icons/lucide/<name>.svg and assets/icons/tabler/<name>.svg), animated spinners (assets/spinners/), and three reference pages under assets/templates/ (a Three.js 3D hero, a glass dashboard, a gradient landing). Inline an icon's SVG directly into your HTML (stroke="currentColor") instead of leaving buttons/rows without icons. For real 3D use Three.js from cdnjs: https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js.
 When you build a web page or any UI, verify it in the browser before finishing: open it with browser_navigate, then click every button and link, scroll the page, and take a screenshot of each step (browser_click and browser_scroll save a screenshot automatically). Confirm from those screenshots that everything works and looks right. If a page shows a CAPTCHA or similar challenge, read it with browser_snapshot or browser_screenshot and type the answer with browser_type.
 When the task asks for a screenshot, page text, or anything that lives on a live website, you MUST use the browser tools (browser_navigate, browser_screenshot, browser_text, browser_snapshot). NEVER fake this work: do not fetch pages with run_command (curl/wget/urllib/requests), do not generate or draw images with Python/PIL, and do not copy existing or old screenshot files to pretend they are new. A screenshot must come from browser_screenshot of the real page, and page content must come from browser_text/browser_snapshot. If a page will not load or blocks the browser, report it as failed rather than inventing content.`)
 	}

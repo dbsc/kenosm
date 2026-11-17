@@ -41,6 +41,28 @@ func TestWriteFileStripsWorkspacePrefix(t *testing.T) {
 	}
 }
 
+func TestListFilesSkipsAssetsLibrary(t *testing.T) {
+	w := newTestWorkspace(t)
+
+	if err := w.WriteFile("app/index.html", "<html></html>"); err != nil {
+		t.Fatalf("WriteFile app: %v", err)
+	}
+	// The design library has thousands of files; it must never be listed.
+	for _, p := range []string{"assets/icons/a.svg", "assets/icons/b.svg", "assets/README.md"} {
+		if err := w.WriteFile(p, "<svg/>"); err != nil {
+			t.Fatalf("WriteFile %s: %v", p, err)
+		}
+	}
+
+	files, err := w.ListFiles()
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(files) != 1 || files[0].Path != "app/index.html" {
+		t.Fatalf("files = %v, want only [app/index.html]", files)
+	}
+}
+
 func TestReadFileStripsWorkspacePrefix(t *testing.T) {
 	w := newTestWorkspace(t)
 	if err := w.WriteFile("app/index.html", "hello"); err != nil {

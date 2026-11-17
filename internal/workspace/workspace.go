@@ -168,6 +168,9 @@ func (w *Workspace) ListFiles() ([]FileInfo, error) {
 			return err
 		}
 		if info.IsDir() {
+			if info.Name() == "assets" && filepath.Dir(path) == w.root {
+				return filepath.SkipDir // design library: thousands of files, never listed
+			}
 			return nil
 		}
 		rel, err := filepath.Rel(w.root, path)
@@ -224,6 +227,9 @@ func (w *Workspace) Search(query string) ([]string, error) {
 		if d.IsDir() {
 			if strings.HasPrefix(d.Name(), ".") {
 				return filepath.SkipDir
+			}
+			if d.Name() == "assets" && filepath.Dir(path) == w.root {
+				return filepath.SkipDir // design library: skip for content search
 			}
 			return nil
 		}
