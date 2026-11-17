@@ -52,6 +52,50 @@ func tool(name, description string, params map[string]any, run func(*Agent, cont
 	return Tool{def: llm.Tool{Name: name, Description: description, Parameters: params}, run: run}
 }
 
+// Module is a group of related tools that can be toggled on or off as a unit.
+// Optional modules need an external runtime (browser or desktop) and are only
+// truly enabled when that runtime is available.
+type Module struct {
+	Name     string   `json:"name"`
+	Label    string   `json:"label"`
+	Tools    []string `json:"tools"`
+	Optional bool     `json:"optional"`
+}
+
+func toolNamesOf(ts []Tool) []string {
+	names := make([]string, 0, len(ts))
+	for _, t := range ts {
+		names = append(names, t.def.Name)
+	}
+	return names
+}
+
+// Modules returns the tool modules in display order.
+func Modules() []Module {
+	return []Module{
+		{Name: "files", Label: "Files — read & write code", Tools: toolNamesOf(fileTools()), Optional: false},
+		{Name: "shell", Label: "Shell — run commands", Tools: toolNamesOf(shellTools()), Optional: false},
+		{Name: "browser", Label: "Browser — browse & click", Tools: toolNamesOf(browserTools()), Optional: true},
+		{Name: "desktop", Label: "Desktop — screenshots & input", Tools: toolNamesOf(desktopTools()), Optional: true},
+	}
+}
+
+// DisabledToolNames maps disabled module names to the concrete tool names to
+// exclude. Unknown module names are ignored.
+func DisabledToolNames(disabledModules []string) []string {
+	disabled := make(map[string]bool, len(disabledModules))
+	for _, m := range disabledModules {
+		disabled[strings.TrimSpace(m)] = true
+	}
+	var out []string
+	for _, mod := range Modules() {
+		if disabled[mod.Name] {
+			out = append(out, mod.Tools...)
+		}
+	}
+	return out
+}
+
 // Agent is a tool-using loop: it repeatedly asks the model, executes any tool
 // calls (write files, read files, list files, run commands, drive a browser,
 // control the desktop), and feeds results back until the model finishes.

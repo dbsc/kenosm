@@ -81,3 +81,34 @@ func TestDisabledToolsFilter(t *testing.T) {
 		t.Fatalf("non-disabled tools missing: %v", names)
 	}
 }
+
+func TestModulesAndDisabledToolNames(t *testing.T) {
+	mods := Modules()
+	seen := map[string]bool{}
+	for _, m := range mods {
+		seen[m.Name] = true
+		if len(m.Tools) == 0 {
+			t.Errorf("module %q has no tools", m.Name)
+		}
+	}
+	for _, want := range []string{"files", "shell", "browser", "desktop"} {
+		if !seen[want] {
+			t.Errorf("missing module %q", want)
+		}
+	}
+
+	disabled := DisabledToolNames([]string{"shell", "desktop"})
+	if len(disabled) == 0 {
+		t.Fatal("expected disabled tools for shell+desktop")
+	}
+	set := map[string]bool{}
+	for _, n := range disabled {
+		set[n] = true
+	}
+	if !set["run_command"] {
+		t.Errorf("expected run_command to be disabled, got %v", disabled)
+	}
+	if set["write_file"] || set["browser_navigate"] {
+		t.Errorf("files/browser tools should not be disabled, got %v", disabled)
+	}
+}

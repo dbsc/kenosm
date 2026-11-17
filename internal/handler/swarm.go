@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"kenosm/internal/agent"
 	"kenosm/internal/browser"
 	"kenosm/internal/desktop"
 	"kenosm/internal/llm"
@@ -40,10 +43,12 @@ type Swarm struct {
 	prices            pricing.Table
 	activity          *repository.ActivityRepo
 	transportCache    *transport.Cache
-	sem               chan struct{} // bounds concurrent runs (spawning browsers + model calls)
+	mu                sync.Mutex      // guards disabledModules
+	disabledModules   map[string]bool // tool modules disabled at runtime
+	sem               chan struct{}   // bounds concurrent runs (spawning browsers + model calls)
 }
 
-func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo, tc *transport.Cache, maxConcurrent int) *Swarm {
+func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo, tc *transport.Cache, disabledModules []string, maxConcurrent int) *Swarm {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1
 	}
@@ -61,8 +66,20 @@ func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *
 		prices:            prices,
 		activity:          activity,
 		transportCache:    tc,
+		disabledModules:   moduleSet(disabledModules),
 		sem:               make(chan struct{}, maxConcurrent),
 	}
+}
+
+func moduleSet(names []string) map[string]bool {
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n != "" {
+			m[n] = true
+		}
+	}
+	return m
 }
 
 // tryAcquireRun reserves a slot for a concurrent run, returning false when the
@@ -173,6 +190,7 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 		OrchestratorModel: h.orchestratorModel,
 		DefaultModel:      h.defaultModel,
 		AvailableModels:   h.availableModels,
+		DisabledModules:   h.disabledModuleList(),
 		Workspace:         h.ws,
 		Browser:           h.browser,
 		Desktop:           h.desktop,
@@ -384,4 +402,90 @@ func (h *Swarm) Models(w http.ResponseWriter, _ *http.Request) {
 		"default_model":      h.defaultModel,
 		"available_models":   h.availableModels,
 	})
+}
+
+// moduleView is one tool module as exposed to the frontend, augmented with its
+// runtime availability (browser/desktop may be absent) and current toggle.
+type moduleView struct {
+	Name      string   `json:"name"`
+	Label     string   `json:"label"`
+	Tools     []string `json:"tools"`
+	Optional  bool     `json:"optional"`
+	Available bool     `json:"available"`
+	Enabled   bool     `json:"enabled"`
+}
+
+// Modules returns the tool modules with their current enabled/available state.
+func (h *Swarm) Modules(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, h.moduleViews())
+}
+
+// SetModule enables or disables a tool module at runtime. The change applies to
+// runs started afterwards and resets to the DISABLED_MODULES default on restart.
+func (h *Swarm) SetModule(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name    string `json:"name"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	name := strings.TrimSpace(in.Name)
+	if !isKnownModule(name) {
+		writeError(w, http.StatusBadRequest, "unknown module: "+name)
+		return
+	}
+	h.mu.Lock()
+	if in.Enabled {
+		delete(h.disabledModules, name)
+	} else {
+		h.disabledModules[name] = true
+	}
+	h.mu.Unlock()
+	writeJSON(w, http.StatusOK, h.moduleViews())
+}
+
+func (h *Swarm) moduleViews() []moduleView {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	views := make([]moduleView, 0, 4)
+	for _, m := range agent.Modules() {
+		available := true
+		switch m.Name {
+		case "browser":
+			available = h.browser != nil
+		case "desktop":
+			available = h.desktop != nil
+		}
+		views = append(views, moduleView{
+			Name:      m.Name,
+			Label:     m.Label,
+			Tools:     m.Tools,
+			Optional:  m.Optional,
+			Available: available,
+			Enabled:   available && !h.disabledModules[m.Name],
+		})
+	}
+	return views
+}
+
+func (h *Swarm) disabledModuleList() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, 0, len(h.disabledModules))
+	for name := range h.disabledModules {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func isKnownModule(name string) bool {
+	for _, m := range agent.Modules() {
+		if m.Name == name {
+			return true
+		}
+	}
+	return false
 }

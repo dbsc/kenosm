@@ -19,6 +19,7 @@ type Config struct {
 	GeminiModel       string
 	OrchestratorModel string
 	AvailableModels   []string
+	DisabledModules   []string
 	WorkspaceDir      string
 	CommandTimeout    time.Duration
 	ShutdownTimeout   time.Duration
@@ -37,7 +38,8 @@ func Load() (*Config, error) {
 		APIKey:            os.Getenv("KENOSM_API_KEY"),
 		GeminiModel:       getenv("GEMINI_MODEL", "gemini-3.8-flash"),
 		OrchestratorModel: getenv("ORCHESTRATOR_MODEL", "gemini-3.8-flash"),
-		AvailableModels:   splitModels(getenv("AVAILABLE_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite,gemini-flash-latest")),
+		AvailableModels:   splitCSV(getenv("AVAILABLE_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite,gemini-flash-latest")),
+		DisabledModules:   splitCSV(getenv("DISABLED_MODULES", "")),
 		WorkspaceDir:      getenv("WORKSPACE_DIR", "workspace"),
 		CommandTimeout:    durationFromEnv("COMMAND_TIMEOUT", 30*time.Second),
 		ShutdownTimeout:   durationFromEnv("SHUTDOWN_TIMEOUT", 30*time.Second),
@@ -77,7 +79,7 @@ func getenv(key, def string) string {
 	return def
 }
 
-func splitModels(s string) []string {
+func splitCSV(s string) []string {
 	var out []string
 	for _, m := range strings.Split(s, ",") {
 		m = strings.TrimSpace(m)

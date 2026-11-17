@@ -50,6 +50,10 @@ func New(admin *handler.Admin, gateway *handler.Gateway, swarm *handler.Swarm, w
 		r.Post("/api/v1/swarm/run/{runID}/stop", swarm.Stop)
 		r.Get("/api/v1/models", swarm.Models)
 
+		// Tool modules (toggleable groups of agent tools).
+		r.Get("/api/v1/tools/modules", swarm.Modules)
+		r.Put("/api/v1/tools/modules", swarm.SetModule)
+
 		// Chat sessions (persistent conversations, single-agent or swarm turns).
 		r.Get("/api/v1/chats", swarm.ListChats)
 		r.Post("/api/v1/chats", swarm.CreateChat)

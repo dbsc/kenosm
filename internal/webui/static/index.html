@@ -14,6 +14,7 @@
       <button data-tab="swarm" class="tab active">Chat</button>
       <button data-tab="files" class="tab">Files</button>
       <button data-tab="stats" class="tab">Stats</button>
+      <button data-tab="tools" class="tab">Tools</button>
     </nav>
   </header>
 
@@ -132,6 +133,13 @@
         <select id="timeline-run" style="max-width:340px"></select>
       </div>
       <div id="timeline" class="timeline"></div>
+    </section>
+
+    <!-- Tool modules -->
+    <section id="tab-tools" class="tab-panel">
+      <h2>Tool modules</h2>
+      <p class="hint">Groups of agent tools you can turn on or off. Changes apply to the next run and reset to DISABLED_MODULES on restart.</p>
+      <div id="modules-list" class="list"></div>
     </section>
   </main>
 

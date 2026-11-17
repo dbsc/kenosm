@@ -33,6 +33,7 @@ type Config struct {
 	OrchestratorModel string
 	DefaultModel      string
 	AvailableModels   []string
+	DisabledModules   []string // module names to exclude (see agent.Modules)
 	Workspace         *workspace.Workspace
 	Browser           *browser.Browser // optional; enables the browser_* tools
 	Desktop           *desktop.Desktop // optional; enables the desktop_* tools
@@ -825,13 +826,14 @@ func (s *Swarm) runWorker(ctx context.Context, a Agent, model, systemExtra strin
 			continue
 		}
 		ag := agent.New(agent.Config{
-			LLM:         client,
-			Workspace:   s.cfg.Workspace,
-			Browser:     s.cfg.Browser,
-			Desktop:     s.cfg.Desktop,
-			Log:         s.workerLog(a, client),
-			OnUsage:     s.usageLog(a, client),
-			SystemExtra: systemExtra,
+			LLM:           client,
+			Workspace:     s.cfg.Workspace,
+			Browser:       s.cfg.Browser,
+			Desktop:       s.cfg.Desktop,
+			Log:           s.workerLog(a, client),
+			OnUsage:       s.usageLog(a, client),
+			DisabledTools: agent.DisabledToolNames(s.cfg.DisabledModules),
+			SystemExtra:   systemExtra,
 		})
 		res, err := ag.RunWithHistory(ctx, history)
 		if err == nil {

@@ -13,6 +13,7 @@ $$(".tab").forEach((btn) => {
     if (btn.dataset.tab === "files") loadFiles();
     if (btn.dataset.tab === "agents") loadAgents();
     if (btn.dataset.tab === "stats") loadStats();
+    if (btn.dataset.tab === "tools") loadModules();
   });
 });
 
@@ -29,6 +30,7 @@ document.addEventListener("click", (ev) => {
     case "deleteAgent": deleteAgent(el.dataset.id); break;
     case "removeAttachment": removeAttachment(Number(el.dataset.index)); break;
     case "viewFile": viewFile(el.dataset.path); break;
+    case "toggleModule": toggleModule(el.dataset.module, el.checked); break;
   }
 });
 
@@ -492,6 +494,39 @@ async function viewFile(path) {
     box.textContent = data.content || "";
   }
   $("#file-viewer").classList.remove("hidden");
+}
+
+// ---------- Tool modules ----------
+async function loadModules() {
+  const res = await apiFetch("/api/v1/tools/modules");
+  if (!res.ok) return;
+  const mods = await res.json();
+  const el = $("#modules-list");
+  el.innerHTML = mods
+    .map(
+      (m) => `
+      <div class="card">
+        <div class="meta">
+          <div class="name">${esc(m.label)} <span class="badge">${esc(m.name)}</span></div>
+          <div class="sub">${m.tools.map(esc).join(" · ")}</div>
+        </div>
+        <div class="actions">
+          ${m.available
+            ? `<label class="check">enabled <input type="checkbox" data-action="toggleModule" data-module="${esc(m.name)}" ${m.enabled ? "checked" : ""} /></label>`
+            : `<span class="hint">runtime unavailable</span>`}
+        </div>
+      </div>`
+    )
+    .join("");
+}
+
+async function toggleModule(name, enabled) {
+  await apiFetch("/api/v1/tools/modules", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, enabled }),
+  });
+  loadModules(); // re-sync with server state
 }
 
 // ---------- Stats ----------
