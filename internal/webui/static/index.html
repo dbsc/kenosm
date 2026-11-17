@@ -75,6 +75,7 @@
             <div id="attachments" class="attachments"></div>
             <textarea id="task" rows="2" placeholder="Write a message…"></textarea>
             <div class="input-bar">
+              <button id="btn-prompt-gen" class="btn small ghost" title="Rewrite a rough idea into a task prompt">Generate prompt</button>
               <div class="mode-toggle">
                 <button id="btn-mode-single" class="btn small active">Single</button>
                 <button id="btn-mode-swarm" class="btn small">Swarm</button>
@@ -163,6 +164,24 @@
       <div class="modal-actions">
         <button id="modal-cancel" class="btn ghost">Cancel</button>
         <button id="modal-confirm" class="btn danger">I'm sure</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="prompt-modal" class="modal hidden">
+    <div class="modal-box modal-wide">
+      <h3>Generate task prompt</h3>
+      <p class="hint">Paste a rough idea. The model rewrites it into a detailed, self-contained task prompt you can copy or drop straight into the chat.</p>
+      <textarea id="prompt-idea" rows="4" placeholder="Rough idea…"></textarea>
+      <div class="row">
+        <button id="btn-prompt-generate" class="btn">Generate</button>
+        <span id="prompt-status" class="hint"></span>
+      </div>
+      <textarea id="prompt-result" rows="10" placeholder="The refined prompt will appear here…" readonly></textarea>
+      <div class="modal-actions">
+        <button id="btn-prompt-copy" class="btn ghost">Copy</button>
+        <button id="btn-prompt-use" class="btn">Use in chat</button>
+        <button id="btn-prompt-close" class="btn ghost">Close</button>
       </div>
     </div>
   </div>

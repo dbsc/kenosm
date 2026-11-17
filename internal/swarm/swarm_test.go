@@ -344,3 +344,10 @@ func TestParseReviewInvalid(t *testing.T) {
 		t.Fatalf("expected error for non-JSON reviewer output")
 	}
 }
+
+func TestGeneratePromptNoAgents(t *testing.T) {
+	s := New(Config{})
+	if _, err := s.GeneratePrompt(t.Context(), "make a site"); err == nil {
+		t.Fatalf("expected error when no agents are configured")
+	}
+}

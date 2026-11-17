@@ -50,6 +50,9 @@ func New(admin *handler.Admin, gateway *handler.Gateway, swarm *handler.Swarm, w
 		r.Post("/api/v1/swarm/run/{runID}/stop", swarm.Stop)
 		r.Get("/api/v1/models", swarm.Models)
 
+		// Prompt generator: rewrite a rough idea into a ready-to-run task prompt.
+		r.Post("/api/v1/prompt/generate", swarm.GeneratePrompt)
+
 		// Tool modules (toggleable groups of agent tools).
 		r.Get("/api/v1/tools/modules", swarm.Modules)
 		r.Put("/api/v1/tools/modules", swarm.SetModule)

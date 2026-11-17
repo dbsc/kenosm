@@ -928,6 +928,70 @@ function renderTimeline(bars) {
   el.innerHTML = rows;
 }
 
+// ---------- Prompt generator ----------
+function openPromptGen() {
+  // Pre-fill with any draft already in the task box so it can be refined.
+  $("#prompt-idea").value = $("#task").value.trim();
+  $("#prompt-result").value = "";
+  $("#prompt-status").textContent = "";
+  $("#prompt-modal").classList.remove("hidden");
+  setTimeout(() => $("#prompt-idea").focus(), 0);
+}
+
+function closePromptGen() {
+  $("#prompt-modal").classList.add("hidden");
+}
+
+async function generatePrompt() {
+  const idea = $("#prompt-idea").value.trim();
+  if (!idea) {
+    $("#prompt-status").textContent = "Type an idea first.";
+    return;
+  }
+  const btn = $("#btn-prompt-generate");
+  btn.disabled = true;
+  $("#prompt-status").textContent = "Generating…";
+  $("#prompt-result").value = "";
+  try {
+    const res = await apiFetch("/api/v1/prompt/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ idea }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      $("#prompt-status").textContent = "Error: " + (data.error || res.status);
+      return;
+    }
+    $("#prompt-result").value = data.prompt || "";
+    $("#prompt-status").textContent = "Done.";
+  } catch (e) {
+    $("#prompt-status").textContent = "Error: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function copyPrompt() {
+  const text = $("#prompt-result").value;
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    // Fall back for contexts where the async Clipboard API is unavailable.
+    $("#prompt-result").select();
+    document.execCommand("copy");
+  }
+  $("#prompt-status").textContent = "Copied.";
+}
+
+function usePrompt() {
+  const text = $("#prompt-result").value.trim();
+  if (text) $("#task").value = text;
+  closePromptGen();
+  $("#task").focus();
+}
+
 // ---------- Modal ----------
 let modalConfirmHandler = null;
 
@@ -970,6 +1034,17 @@ $("#modal-confirm").addEventListener("click", () => {
 });
 $("#modal").addEventListener("click", (e) => {
   if (e.target === $("#modal")) hideModal();
+});
+$("#btn-prompt-gen").addEventListener("click", openPromptGen);
+$("#btn-prompt-generate").addEventListener("click", generatePrompt);
+$("#btn-prompt-copy").addEventListener("click", copyPrompt);
+$("#btn-prompt-use").addEventListener("click", usePrompt);
+$("#btn-prompt-close").addEventListener("click", closePromptGen);
+$("#prompt-modal").addEventListener("click", (e) => {
+  if (e.target === $("#prompt-modal")) closePromptGen();
+});
+$("#prompt-idea").addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") generatePrompt();
 });
 
 loadAgents();

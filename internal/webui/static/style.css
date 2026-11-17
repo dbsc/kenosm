@@ -344,6 +344,12 @@ ol { margin: 0.25rem 0; padding-left: 1.4rem; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 0.6rem; }
 .modal.hidden { display: none; }
 
+.modal-box.modal-wide { max-width: 640px; }
+.modal-box .row { margin-top: 0.5rem; }
+.modal-box textarea { margin-top: 0.5rem; }
+.modal-box #prompt-status { flex: 1; }
+.modal-box .modal-actions { margin-top: 0.75rem; }
+
 /* ---------- Chat: tabs, mode toggle, bubbles ---------- */
 .console-head { flex-wrap: wrap; gap: 0.5rem; }
 

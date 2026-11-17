@@ -168,6 +168,57 @@ func (h *Swarm) loadAgents(ctx context.Context) ([]swarm.Agent, error) {
 	return swarm.AgentsFromServices(services), nil
 }
 
+// newSwarm builds a swarm instance with the handler's runtime configuration,
+// shared by runTurn and the single-turn prompt generator.
+func (h *Swarm) newSwarm(agents []swarm.Agent, emitter swarm.Emitter) *swarm.Swarm {
+	return swarm.New(swarm.Config{
+		Agents:            agents,
+		OrchestratorModel: h.orchestratorModel,
+		DefaultModel:      h.defaultModel,
+		AvailableModels:   h.availableModels,
+		DisabledModules:   h.disabledModuleList(),
+		Workspace:         h.ws,
+		Browser:           h.browser,
+		Desktop:           h.desktop,
+		Emitter:           emitter,
+		TransportCache:    h.transportCache,
+		PolishMaxRounds:   h.polishMaxRounds,
+		MaxIterations:     h.agentMaxIterations,
+	})
+}
+
+// GeneratePrompt rewrites a rough idea into a detailed, self-contained task
+// prompt for the swarm, using the orchestrator's model. It is a single LLM call
+// (no workers, no browsers) and blocks until the model responds.
+func (h *Swarm) GeneratePrompt(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Idea string `json:"idea"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(in.Idea) == "" {
+		writeError(w, http.StatusBadRequest, "idea is required")
+		return
+	}
+
+	agents, err := h.loadAgents(r.Context())
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	defer cancel()
+	prompt, err := h.newSwarm(agents, nil).GeneratePrompt(ctx, in.Idea)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"prompt": prompt})
+}
+
 // runTurn starts a single- or swarm-mode turn in the background and returns its
 // run ID. The emitter records every event to the live stream and persists each
 // usage event to the DB immediately, so stats update while the run executes.
@@ -195,20 +246,7 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 		}
 	}
 
-	sw := swarm.New(swarm.Config{
-		Agents:            agents,
-		OrchestratorModel: h.orchestratorModel,
-		DefaultModel:      h.defaultModel,
-		AvailableModels:   h.availableModels,
-		DisabledModules:   h.disabledModuleList(),
-		Workspace:         h.ws,
-		Browser:           h.browser,
-		Desktop:           h.desktop,
-		Emitter:           emitter,
-		TransportCache:    h.transportCache,
-		PolishMaxRounds:   h.polishMaxRounds,
-		MaxIterations:     h.agentMaxIterations,
-	})
+	sw := h.newSwarm(agents, emitter)
 
 	// A fresh context lets the run outlive the HTTP request; its cancel is wired
 	// into the registry synchronously so Stop works even if called immediately.

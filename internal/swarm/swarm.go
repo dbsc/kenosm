@@ -943,6 +943,53 @@ func formatHistory(history []llm.Turn) string {
 	return strings.TrimSpace(sb.String())
 }
 
+// promptWriterSystem tells the model how to turn a rough idea into a single,
+// self-contained task prompt an autonomous agent swarm can execute.
+const promptWriterSystem = `You turn a rough idea into ONE ready-to-run task prompt for an autonomous agent swarm. The swarm's agents have a real headless browser, a shell, file tools and (optionally) desktop control; they build real artifacts and verify them before finishing.
+
+Rewrite the idea into a single clear, specific task prompt that:
+- states the concrete goal and the desired end result (what "done" looks like);
+- lists concrete, verifiable acceptance criteria;
+- names any technology, files, or visual/aesthetic requirements the idea implies;
+- is self-contained: a fresh agent with no other context could execute it.
+
+Keep the user's language. Output ONLY the task prompt — no preamble, no commentary, no markdown fences.`
+
+// GeneratePrompt rewrites a rough idea into a detailed task prompt using the
+// orchestrator's model (same agent/model selection as Run). It is a single-turn,
+// no-tools call and does not spawn any workers or browsers.
+func (s *Swarm) GeneratePrompt(ctx context.Context, idea string) (string, error) {
+	agents := s.cfg.Agents
+	if len(agents) == 0 {
+		return "", fmt.Errorf("no agents configured")
+	}
+
+	orchAgent := agents[0]
+	for _, a := range agents {
+		if !isOpenAI(a.Provider) {
+			orchAgent = a
+			break
+		}
+	}
+	orchModel := s.cfg.OrchestratorModel
+	if isOpenAI(orchAgent.Provider) {
+		orchModel = "deepseek-chat"
+	}
+
+	orch, err := s.buildClient(orchAgent, orchModel)
+	if err != nil {
+		return "", err
+	}
+	res, err := orch.Generate(ctx, promptWriterSystem, []llm.Turn{{Role: "user", Text: strings.TrimSpace(idea)}}, nil)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(res.Text) == "" {
+		return "", fmt.Errorf("model returned an empty prompt")
+	}
+	return strings.TrimSpace(res.Text), nil
+}
+
 func (s *Swarm) buildClient(a Agent, model string) (llm.Client, error) {
 	cfg := llm.Config{
 		BaseURL: a.BaseURL,
