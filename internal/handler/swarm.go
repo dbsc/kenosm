@@ -30,49 +30,54 @@ const runTimeout = 30 * time.Minute
 // Swarm exposes the multi-agent orchestration endpoint. Agents are the enabled
 // gateway services (each a Gemini endpoint + its SOCKS5 proxy).
 type Swarm struct {
-	repo              *repository.ServiceRepo
-	usage             *repository.UsageRepo
-	orchestratorModel string
-	defaultModel      string
-	availableModels   []string
-	ws                *workspace.Workspace
-	browser           *browser.Browser
-	desktop           *desktop.Desktop
-	registry          *runRegistry
-	chats             *repository.ChatRepo
-	prices            pricing.Table
-	activity          *repository.ActivityRepo
-	transportCache    *transport.Cache
-	mu                sync.Mutex      // guards disabledModules
-	disabledModules   map[string]bool // tool modules disabled at runtime
-	sem               chan struct{}   // bounds concurrent runs (spawning browsers + model calls)
-	polishMaxRounds   int             // max self-review rounds in polish mode
+	repo               *repository.ServiceRepo
+	usage              *repository.UsageRepo
+	orchestratorModel  string
+	defaultModel       string
+	availableModels    []string
+	ws                 *workspace.Workspace
+	browser            *browser.Browser
+	desktop            *desktop.Desktop
+	registry           *runRegistry
+	chats              *repository.ChatRepo
+	prices             pricing.Table
+	activity           *repository.ActivityRepo
+	transportCache     *transport.Cache
+	mu                 sync.Mutex      // guards disabledModules
+	disabledModules    map[string]bool // tool modules disabled at runtime
+	sem                chan struct{}   // bounds concurrent runs (spawning browsers + model calls)
+	polishMaxRounds    int             // max self-review rounds in polish mode
+	agentMaxIterations int             // max agent tool-call turns per subtask
 }
 
-func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo, tc *transport.Cache, disabledModules []string, maxConcurrent, polishMaxRounds int) *Swarm {
+func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo, tc *transport.Cache, disabledModules []string, maxConcurrent, polishMaxRounds, agentMaxIterations int) *Swarm {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1
 	}
 	if polishMaxRounds <= 0 {
 		polishMaxRounds = 3
 	}
+	if agentMaxIterations <= 0 {
+		agentMaxIterations = 50
+	}
 	return &Swarm{
-		repo:              repo,
-		usage:             usage,
-		orchestratorModel: orchestratorModel,
-		defaultModel:      defaultModel,
-		availableModels:   availableModels,
-		ws:                ws,
-		browser:           br,
-		desktop:           dsk,
-		registry:          newRunRegistry(),
-		chats:             chats,
-		prices:            prices,
-		activity:          activity,
-		transportCache:    tc,
-		disabledModules:   moduleSet(disabledModules),
-		sem:               make(chan struct{}, maxConcurrent),
-		polishMaxRounds:   polishMaxRounds,
+		repo:               repo,
+		usage:              usage,
+		orchestratorModel:  orchestratorModel,
+		defaultModel:       defaultModel,
+		availableModels:    availableModels,
+		ws:                 ws,
+		browser:            br,
+		desktop:            dsk,
+		registry:           newRunRegistry(),
+		chats:              chats,
+		prices:             prices,
+		activity:           activity,
+		transportCache:     tc,
+		disabledModules:    moduleSet(disabledModules),
+		sem:                make(chan struct{}, maxConcurrent),
+		polishMaxRounds:    polishMaxRounds,
+		agentMaxIterations: agentMaxIterations,
 	}
 }
 
@@ -202,6 +207,7 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 		Emitter:           emitter,
 		TransportCache:    h.transportCache,
 		PolishMaxRounds:   h.polishMaxRounds,
+		MaxIterations:     h.agentMaxIterations,
 	})
 
 	// A fresh context lets the run outlive the HTTP request; its cancel is wired

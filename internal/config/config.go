@@ -12,21 +12,22 @@ import (
 
 // Config holds runtime configuration, loaded from environment variables.
 type Config struct {
-	Addr              string
-	DatabaseURL       string
-	SecretKey         string
-	APIKey            string
-	GeminiModel       string
-	OrchestratorModel string
-	AvailableModels   []string
-	DisabledModules   []string
-	WorkspaceDir      string
-	CommandTimeout    time.Duration
-	ShutdownTimeout   time.Duration
-	MaxConcurrentRuns int
-	PolishMaxRounds   int
-	LogRetentionDays  int
-	Prices            pricing.Table
+	Addr               string
+	DatabaseURL        string
+	SecretKey          string
+	APIKey             string
+	GeminiModel        string
+	OrchestratorModel  string
+	AvailableModels    []string
+	DisabledModules    []string
+	WorkspaceDir       string
+	CommandTimeout     time.Duration
+	ShutdownTimeout    time.Duration
+	MaxConcurrentRuns  int
+	PolishMaxRounds    int
+	AgentMaxIterations int
+	LogRetentionDays   int
+	Prices             pricing.Table
 }
 
 // Load reads configuration from the environment, applying development defaults
@@ -36,21 +37,22 @@ func Load() (*Config, error) {
 	loadDotEnv()
 
 	cfg := &Config{
-		Addr:              getenv("ADDR", ":8080"),
-		DatabaseURL:       getenv("DATABASE_URL", "postgres://kenosm:kenosm@localhost:5432/kenosm?sslmode=disable"),
-		SecretKey:         os.Getenv("SECRET_KEY"),
-		APIKey:            os.Getenv("KENOSM_API_KEY"),
-		GeminiModel:       getenv("GEMINI_MODEL", "gemini-3.8-flash"),
-		OrchestratorModel: getenv("ORCHESTRATOR_MODEL", "gemini-3.8-flash"),
-		AvailableModels:   splitCSV(getenv("AVAILABLE_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite,gemini-flash-latest")),
-		DisabledModules:   splitCSV(getenv("DISABLED_MODULES", "")),
-		WorkspaceDir:      getenv("WORKSPACE_DIR", "workspace"),
-		CommandTimeout:    durationFromEnv("COMMAND_TIMEOUT", 30*time.Second),
-		ShutdownTimeout:   durationFromEnv("SHUTDOWN_TIMEOUT", 30*time.Second),
-		MaxConcurrentRuns: intFromEnv("MAX_CONCURRENT_RUNS", 1),
-		PolishMaxRounds:   intFromEnv("POLISH_MAX_ROUNDS", 5),
-		LogRetentionDays:  intFromEnv("LOG_RETENTION_DAYS", 30),
-		Prices:            pricing.DefaultTable(),
+		Addr:               getenv("ADDR", ":8080"),
+		DatabaseURL:        getenv("DATABASE_URL", "postgres://kenosm:kenosm@localhost:5432/kenosm?sslmode=disable"),
+		SecretKey:          os.Getenv("SECRET_KEY"),
+		APIKey:             os.Getenv("KENOSM_API_KEY"),
+		GeminiModel:        getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+		OrchestratorModel:  getenv("ORCHESTRATOR_MODEL", "gemini-3.8-flash"),
+		AvailableModels:    splitCSV(getenv("AVAILABLE_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite,gemini-flash-latest")),
+		DisabledModules:    splitCSV(getenv("DISABLED_MODULES", "")),
+		WorkspaceDir:       getenv("WORKSPACE_DIR", "workspace"),
+		CommandTimeout:     durationFromEnv("COMMAND_TIMEOUT", 30*time.Second),
+		ShutdownTimeout:    durationFromEnv("SHUTDOWN_TIMEOUT", 30*time.Second),
+		MaxConcurrentRuns:  intFromEnv("MAX_CONCURRENT_RUNS", 1),
+		PolishMaxRounds:    intFromEnv("POLISH_MAX_ROUNDS", 5),
+		AgentMaxIterations: intFromEnv("AGENT_MAX_ITERATIONS", 50),
+		LogRetentionDays:   intFromEnv("LOG_RETENTION_DAYS", 30),
+		Prices:             pricing.DefaultTable(),
 	}
 
 	// MODEL_PRICES overrides the built-in price table with a JSON map, e.g.

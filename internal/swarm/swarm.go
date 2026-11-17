@@ -57,6 +57,7 @@ type Config struct {
 	Emitter           Emitter          // optional progress-event sink
 	TransportCache    *transport.Cache // optional; reuses pooled SOCKS5 transports across agents/runs
 	PolishMaxRounds   int              // max self-review rounds for RunPolish (0 = 3)
+	MaxIterations     int              // max agent tool-call turns per subtask (0 = 50)
 }
 
 type Swarm struct {
@@ -1009,6 +1010,7 @@ func (s *Swarm) runWorker(ctx context.Context, a Agent, model, systemExtra strin
 			OnUsage:       s.usageLog(a, client),
 			DisabledTools: agent.DisabledToolNames(s.cfg.DisabledModules),
 			SystemExtra:   systemExtra,
+			MaxIterations: s.maxIterations(),
 		})
 		res, err := ag.RunWithHistory(ctx, history)
 		if err == nil {
@@ -1074,6 +1076,16 @@ func DirectionFor(tool string) string {
 	default:
 		return "other"
 	}
+}
+
+// maxIterations returns the per-subtask agent tool-call turn budget, so
+// multi-step tasks (deep research, many screenshots) aren't cut off by the
+// agent's small built-in default.
+func (s *Swarm) maxIterations() int {
+	if s.cfg.MaxIterations > 0 {
+		return s.cfg.MaxIterations
+	}
+	return 50
 }
 
 // usageLog emits a per-call usage event so token spend is visible in real time.
