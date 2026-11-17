@@ -271,6 +271,30 @@ ol { margin: 0.25rem 0; padding-left: 1.4rem; }
 
 .live-cost { font-size: 1.1rem; font-weight: 600; margin-top: 0.3rem; font-variant-numeric: tabular-nums; }
 
+/* ---------- Swarm graph + agents-talking transcript ---------- */
+.swarm-graph { margin: 0.4rem 0; }
+.swarm-svg { width: 100%; height: auto; display: block; }
+.swarm-node-orch circle { fill: var(--fg); stroke: var(--fg); }
+.swarm-node-agent circle { fill: var(--bg); stroke: var(--fg); }
+.swarm-label-orch { fill: var(--bg); font-size: 9px; font-family: ui-monospace, Menlo, monospace; text-anchor: middle; dominant-baseline: central; }
+.swarm-label-agent { fill: var(--fg); font-size: 8px; font-family: ui-monospace, Menlo, monospace; text-anchor: middle; dominant-baseline: central; }
+.swarm-signal { stroke: var(--fg); stroke-width: 1; }
+.swarm-pulse { fill: none; stroke: var(--fg); stroke-width: 1; }
+@keyframes swarm-signal-fade { from { opacity: 0.9; } to { opacity: 0; } }
+@keyframes swarm-pulse-grow { from { opacity: 0.7; } to { opacity: 0; } }
+.swarm-signal { animation: swarm-signal-fade 1s ease-out forwards; }
+.swarm-pulse { animation: swarm-pulse-grow 0.8s ease-out forwards; }
+
+.swarm-chat {
+  max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px;
+  font-family: ui-monospace, Menlo, monospace; font-size: 0.7rem;
+}
+.comm-line { border-bottom: 1px dashed var(--border); padding: 2px 0; word-break: break-word; }
+.comm-orch { font-weight: 600; }
+.comm-task { padding-left: 6px; }
+.comm-done { color: var(--muted); padding-left: 6px; }
+.comm-sys { color: var(--muted); font-style: italic; }
+
 /* ---------- Run distribution timeline ---------- */
 .timeline { margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.4rem; }
 .tl-row { display: grid; grid-template-columns: 150px 1fr; gap: 0.6rem; align-items: center; }

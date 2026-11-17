@@ -257,6 +257,12 @@ let currentMode = "single";
 let currentRunId = null;
 let currentES = null;
 
+// Swarm graph state: one fixed orchestrator node plus a node per agent, laid out
+// on a ring around it. Signals (lines) fly between nodes on SSE events.
+const swarmNodes = new Map(); // agent name -> {x, y}
+const swarmOrch = { x: 110, y: 110 };
+const SVGNS = "http://www.w3.org/2000/svg";
+
 function setRunning(running) {
   $("#btn-run").disabled = running;
   $("#btn-stop").classList.toggle("hidden", !running);
@@ -435,6 +441,7 @@ function streamChatRun(runId, thinking) {
         return;
       }
       liveFeed(e);
+      swarmComm(e);
       if (e.type === "done") {
         thinking.textContent = e.result?.final || "";
         thinking.classList.remove("bubble-thinking");
@@ -670,6 +677,160 @@ function liveFeed(e) {
 function clearLiveFeed() {
   const el = $("#live-feed");
   if (el) el.innerHTML = "";
+  const chat = $("#swarm-chat");
+  if (chat) chat.innerHTML = "";
+  swarmNodes.clear();
+  renderSwarmGraph();
+}
+
+// ---------- Swarm graph + agents-talking transcript ----------
+function swarmShort(name) {
+  const parts = String(name || "?").trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return "?";
+  if (parts.length === 1) return parts[0].slice(0, 7);
+  return (parts[0] + " " + parts[parts.length - 1]).slice(0, 9);
+}
+
+function swarmNode(svg, x, y, label, isOrch) {
+  const g = document.createElementNS(SVGNS, "g");
+  g.setAttribute("class", isOrch ? "swarm-node swarm-node-orch" : "swarm-node swarm-node-agent");
+  const c = document.createElementNS(SVGNS, "circle");
+  c.setAttribute("cx", x);
+  c.setAttribute("cy", y);
+  c.setAttribute("r", isOrch ? 20 : 17);
+  g.appendChild(c);
+  const t = document.createElementNS(SVGNS, "text");
+  t.setAttribute("x", x);
+  t.setAttribute("y", y);
+  t.setAttribute("class", isOrch ? "swarm-label-orch" : "swarm-label-agent");
+  t.textContent = label;
+  g.appendChild(t);
+  svg.appendChild(g);
+}
+
+function renderSwarmGraph() {
+  const el = $("#swarm-graph");
+  if (!el) return;
+  el.innerHTML = "";
+  const svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("viewBox", "0 0 220 220");
+  svg.setAttribute("class", "swarm-svg");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "swarm agents");
+  swarmNode(svg, swarmOrch.x, swarmOrch.y, "orch", true);
+  const names = [...swarmNodes.keys()];
+  names.forEach((n, i) => {
+    const ang = (i / Math.max(1, names.length)) * Math.PI * 2 - Math.PI / 2;
+    const x = swarmOrch.x + Math.cos(ang) * 80;
+    const y = swarmOrch.y + Math.sin(ang) * 80;
+    swarmNodes.set(n, { x, y });
+    swarmNode(svg, x, y, swarmShort(n), false);
+  });
+  el.appendChild(svg);
+}
+
+function swarmPos(name) {
+  if (name === "orchestrator" || name === "orch") return swarmOrch;
+  return swarmNodes.get(name) || null;
+}
+
+function swarmSignal(from, to) {
+  const svg = $("#swarm-graph svg");
+  if (!svg) return;
+  const a = swarmPos(from);
+  const b = swarmPos(to);
+  if (!a || !b) return;
+  const line = document.createElementNS(SVGNS, "line");
+  line.setAttribute("x1", a.x);
+  line.setAttribute("y1", a.y);
+  line.setAttribute("x2", b.x);
+  line.setAttribute("y2", b.y);
+  line.setAttribute("class", "swarm-signal");
+  svg.appendChild(line);
+  setTimeout(() => line.remove(), 1000);
+}
+
+function swarmPulse(name) {
+  const svg = $("#swarm-graph svg");
+  if (!svg) return;
+  const p = swarmPos(name);
+  if (!p) return;
+  const c = document.createElementNS(SVGNS, "circle");
+  c.setAttribute("cx", p.x);
+  c.setAttribute("cy", p.y);
+  c.setAttribute("r", 17);
+  c.setAttribute("class", "swarm-pulse");
+  svg.appendChild(c);
+  setTimeout(() => c.remove(), 800);
+}
+
+// swarmComm drives the circle graph and the "agents talking" transcript. It runs
+// alongside liveFeed() on every SSE event from a running run.
+function swarmComm(e) {
+  const name = e.agent || "";
+  if (name && !swarmNodes.has(name)) {
+    swarmNodes.set(name, { x: swarmOrch.x, y: swarmOrch.y });
+    renderSwarmGraph();
+  }
+
+  switch (e.type) {
+    case "subtask":
+      if (name) swarmSignal("orchestrator", name); // orchestrator hands out work
+      break;
+    case "subtask_done":
+      if (name) swarmSignal(name, "orchestrator"); // agent reports back
+      break;
+    case "tool":
+      if (name) swarmPulse(name); // agent is actively working
+      break;
+  }
+
+  let label = null;
+  let cls = "comm-sys";
+  switch (e.type) {
+    case "planning":
+      label = "orchestrator is planning…";
+      break;
+    case "plan":
+      label = "orchestrator → " + (e.detail || "plan ready");
+      cls = "comm-orch";
+      break;
+    case "direct":
+      label = (e.agent || "orchestrator") + " → " + (e.detail || "");
+      cls = "comm-orch";
+      break;
+    case "subtask": {
+      const step = e.step != null ? " [step " + e.step + "]" : "";
+      label = "→ " + name + step + ": " + (e.detail || "");
+      cls = "comm-task";
+      break;
+    }
+    case "subtask_done":
+      label = name + " done: " + String(e.detail || "ok").slice(0, 140);
+      cls = "comm-done";
+      break;
+    case "warning":
+      label = "warning: " + (e.detail || "");
+      break;
+    case "done":
+      label = "run complete";
+      break;
+    case "error":
+      label = "error: " + (e.error || e.detail || "");
+      break;
+    case "stopped":
+      label = "stopped";
+      break;
+    default:
+      return;
+  }
+  const el = $("#swarm-chat");
+  if (!el) return;
+  const line = document.createElement("div");
+  line.className = "comm-line " + cls;
+  line.textContent = label;
+  el.prepend(line);
+  while (el.children.length > 100) el.removeChild(el.lastChild);
 }
 
 function renderGroup(rows) {

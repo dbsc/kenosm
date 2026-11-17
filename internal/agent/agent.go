@@ -237,37 +237,79 @@ func (a *Agent) RunWithHistory(ctx context.Context, history []llm.Turn) (Result,
 	return Result{Summary: summary.String(), ToolCalls: callLog, Files: dedupe(a.files), Iterations: iterations, Usage: usage}, nil
 }
 
-// systemPrompt builds the agent instructions, mentioning browser/desktop only
-// when those tools are actually enabled.
+// systemPrompt builds the agent instructions, describing only the capabilities
+// whose tools are actually enabled. Browser/desktop tools are removed when the
+// corresponding module is turned off, even though the runtime is still present,
+// so the prompt must look at the enabled tool set rather than a.browser/a.desktop.
 func (a *Agent) systemPrompt() string {
+	hasFiles := a.hasTool("write_file") || a.hasTool("read_file") || a.hasTool("list_files") || a.hasTool("edit_file") || a.hasTool("search_files")
+	hasShell := a.hasTool("run_command")
+	hasBrowser := a.hasToolPrefix("browser_")
+	hasDesktop := a.hasToolPrefix("desktop_")
+
 	var b strings.Builder
-	b.WriteString(`You are an autonomous coding agent with access to a shared workspace directory.`)
-	b.WriteString("\nYou have tools to write files, read files, list files, edit files, search the workspace, and run shell commands to test your work.")
-	if a.browser != nil {
-		b.WriteString("\nYou also have a real web browser: navigate to any site, click buttons, type into fields, scroll, read page text, and capture screenshots.")
+	b.WriteString("You are an autonomous coding agent with access to a shared workspace directory.")
+
+	var caps []string
+	if hasFiles {
+		caps = append(caps, "read, write, list, edit and search files in the workspace")
 	}
-	if a.desktop != nil {
-		b.WriteString("\nYou can also control the desktop: launch programs, list and focus windows, move and click the mouse, type text, press keys, and screenshot the screen or a specific window.")
+	if hasShell {
+		caps = append(caps, "run shell commands to test your work")
 	}
+	if hasBrowser {
+		caps = append(caps, "drive a real web browser (navigate, click, type, scroll, read page text, and screenshot)")
+	}
+	if hasDesktop {
+		caps = append(caps, "control the desktop (launch programs, manage windows, move and click the mouse, type, and screenshot)")
+	}
+	if len(caps) > 0 {
+		b.WriteString("\nYou have tools to " + strings.Join(caps, "; ") + ".")
+	}
+
 	b.WriteString(`
-Use tools only when the task actually requires them. For analytical, descriptive, or question-answering tasks, answer directly in your response without calling any tools.
+Use tools only when the task actually requires them. For analytical, descriptive, or question-answering tasks, answer directly in your response without calling any tools.`)
+	if hasShell {
+		b.WriteString(`
 When you create or change files, actually test them with the run_command tool before finishing.`)
-	if a.browser != nil {
+	}
+	if hasBrowser {
 		b.WriteString(`
 When you build a web page or any UI, verify it in the browser before finishing: open it with browser_navigate, then click every button and link, scroll the page, and take a screenshot of each step (browser_click and browser_scroll save a screenshot automatically). Confirm from those screenshots that everything works and looks right. If a page shows a CAPTCHA or similar challenge, read it with browser_snapshot or browser_screenshot and type the answer with browser_type.`)
 	}
-	if a.desktop != nil {
+	if hasDesktop {
 		b.WriteString(`
 When you launch a desktop program, verify it actually opened by taking a screenshot (desktop_screenshot), and screenshot each interaction (desktop_click, desktop_type, desktop_key and desktop_scroll capture a screenshot automatically) so you can confirm the result. Use desktop_windows to find a window and desktop_focus to bring it to the front.`)
 	}
+	if hasFiles {
+		b.WriteString(`
+All file paths are relative to the workspace root. Never prefix a path with "workspace/" or an absolute directory — write "app/index.html", not "workspace/app/index.html".`)
+	}
 	b.WriteString(`
-All file paths are relative to the workspace root. Never prefix a path with "workspace/" or an absolute directory — write "app/index.html", not "workspace/app/index.html".
 When finished, output a concise summary of what you did and the result.`)
 
 	if a.systemExtra != "" {
 		b.WriteString("\n\n" + a.systemExtra)
 	}
 	return b.String()
+}
+
+func (a *Agent) hasTool(name string) bool {
+	for _, t := range a.tools {
+		if t.def.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) hasToolPrefix(prefix string) bool {
+	for _, t := range a.tools {
+		if strings.HasPrefix(t.def.Name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // dedupe returns a copy of s with duplicates removed, preserving first-seen order.
