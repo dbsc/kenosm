@@ -29,8 +29,11 @@ type Config struct {
 }
 
 // Load reads configuration from the environment, applying development defaults
-// so the service runs out of the box.
+// so the service runs out of the box. A local ".env" file (if present) is loaded
+// first so `cp .env.example .env` works without exporting the variables.
 func Load() (*Config, error) {
+	loadDotEnv()
+
 	cfg := &Config{
 		Addr:              getenv("ADDR", ":8080"),
 		DatabaseURL:       getenv("DATABASE_URL", "postgres://kenosm:kenosm@localhost:5432/kenosm?sslmode=disable"),
@@ -77,6 +80,37 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// loadDotEnv reads KEY=VALUE lines from ".env" in the working directory (if it
+// exists) and exports them when the key is not already set, so a real shell
+// environment always takes precedence. It ignores blank lines, "#" comments and
+// optional surrounding quotes.
+func loadDotEnv() {
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		if len(val) >= 2 && (val[0] == '"' || val[0] == '\'') && val[len(val)-1] == val[0] {
+			val = val[1 : len(val)-1]
+		}
+		if key != "" {
+			if _, ok := os.LookupEnv(key); !ok {
+				_ = os.Setenv(key, val)
+			}
+		}
+	}
 }
 
 func splitCSV(s string) []string {
