@@ -17,14 +17,31 @@ import (
 	"kenosm/internal/workspace"
 )
 
-// Agent is one swarm member: a Gemini key plus the SOCKS5 proxy it must use.
+// Agent is one swarm member: an upstream model key (Gemini or OpenAI-compatible)
+// plus the SOCKS5 proxy it must use.
 type Agent struct {
 	Name        string
 	Slug        string
 	BaseURL     string
 	APIKey      string
+	Provider    string // "gemini" (default) or "openai" (DeepSeek and other OpenAI-compatible APIs)
 	Proxy       transport.ProxySpec
 	ManualModel string // empty = chosen automatically by the orchestrator
+}
+
+const (
+	providerGemini = "gemini"
+	providerOpenAI = "openai"
+)
+
+// isOpenAI reports whether a provider string selects the OpenAI-compatible
+// backend. "deepseek" is accepted as an alias.
+func isOpenAI(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "openai", "deepseek":
+		return true
+	}
+	return false
 }
 
 // Config configures the swarm.
@@ -39,6 +56,7 @@ type Config struct {
 	Desktop           *desktop.Desktop // optional; enables the desktop_* tools
 	Emitter           Emitter          // optional progress-event sink
 	TransportCache    *transport.Cache // optional; reuses pooled SOCKS5 transports across agents/runs
+	PolishMaxRounds   int              // max self-review rounds for RunPolish (0 = 3)
 }
 
 type Swarm struct {
@@ -108,7 +126,21 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 
 	s.emit(Event{Time: time.Now(), Type: "planning", Detail: "orchestrator is planning the task"})
 
-	orch, err := s.buildClient(agents[0], s.cfg.OrchestratorModel)
+	// Pick a Gemini agent as orchestrator when one exists (mixed-provider
+	// swarms), otherwise fall back to the first agent. The orchestrator model
+	// must be valid for the chosen provider.
+	orchAgent := agents[0]
+	for _, a := range agents {
+		if !isOpenAI(a.Provider) {
+			orchAgent = a
+			break
+		}
+	}
+	orchModel := s.cfg.OrchestratorModel
+	if isOpenAI(orchAgent.Provider) {
+		orchModel = "deepseek-chat"
+	}
+	orch, err := s.buildClient(orchAgent, orchModel)
 	if err != nil {
 		return nil, fmt.Errorf("build orchestrator: %w", err)
 	}
@@ -117,7 +149,7 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	if err != nil {
 		return nil, fmt.Errorf("planning failed: %w", err)
 	}
-	orchModel := orch.Model()
+	orchModel = orch.Model()
 	res.Usage = append(res.Usage, UsageRecord{Agent: "orchestrator", Model: orchModel, Usage: orchUsage})
 	s.emit(Event{Time: time.Now(), Type: "usage", Agent: "orchestrator", Model: orchModel, Usage: orchUsage})
 
@@ -127,30 +159,29 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	if o.Direct {
 		res.Final = o.Answer
 		res.Transcript = append(res.Transcript, TranscriptEntry{Agent: "orchestrator", Role: "assistant", Text: o.Answer})
-		s.emit(Event{Time: time.Now(), Type: "direct", Agent: "orchestrator", Model: orchModel, Detail: truncate(o.Answer, 240)})
+		s.emit(Event{Time: time.Now(), Type: "direct", Agent: "orchestrator", Model: orchModel, Detail: o.Answer})
 		if s.cfg.Workspace != nil {
 			res.Files, _ = s.cfg.Workspace.ListFiles()
 		}
 		return res, nil
 	}
 
-	plan, contract, assignments, deps := o.Plan, o.Contract, o.Assignments, o.Dependencies
-	if deps == nil {
-		// No dependency info: treat every step as independent so the swarm runs
-		// as parallel as possible. The orchestrator is told to specify any
-		// required ordering explicitly via "dependencies".
-		deps = map[int][]int{}
-	}
+	plan, contract, assignments := o.Plan, o.Contract, o.Assignments
+	// All subtasks run in parallel: the shared contract (exact paths, IDs and
+	// signatures) is what keeps them from colliding, not ordering. The
+	// orchestrator's dependency hints are deliberately ignored so every agent
+	// starts immediately and stays busy until the queue is empty.
+	deps := map[int][]int{}
 
 	// A coarse plan (fewer subtasks than agents) would leave agents idle. Ask the
 	// orchestrator once, before anything runs, to expand it into enough parallel
 	// subtasks for every agent.
 	if len(plan) < len(agents) && len(agents) > 1 {
-		if eplan, edeps, eusage, eerr := s.expand(ctx, orch, task, contract, plan, agents); eerr == nil && len(eplan) > len(plan) {
+		if eplan, _, eusage, eerr := s.expand(ctx, orch, task, contract, plan, agents); eerr == nil && len(eplan) > len(plan) {
 			s.emit(Event{Time: time.Now(), Type: "plan", Detail: fmt.Sprintf("plan expanded to %d parallel steps for %d agents", len(eplan), len(agents))})
 			res.Usage = append(res.Usage, UsageRecord{Agent: "orchestrator", Model: orch.Model(), Usage: eusage})
 			s.emit(Event{Time: time.Now(), Type: "usage", Agent: "orchestrator", Model: orch.Model(), Usage: eusage})
-			plan, deps = eplan, edeps
+			plan = eplan
 		}
 	}
 
@@ -197,6 +228,147 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	}
 
 	return res, nil
+}
+
+// reviewVerdict is the decoded output of the self-review pass: either the work is
+// approved, or a concrete list of problems to fix in the next round.
+type reviewVerdict struct {
+	Approved bool   `json:"approved"`
+	Feedback string `json:"feedback"`
+}
+
+// RunPolish runs the swarm and then iteratively self-reviews the result, feeding
+// each round's critique back as a fix task until a reviewer approves the work,
+// the round budget is exhausted, or ctx is canceled. It is the long-running
+// "debug/polish" mode: it keeps going until the result is genuinely done, not
+// merely produced.
+func (s *Swarm) RunPolish(ctx context.Context, task string, images []llm.Image, prior []llm.Turn) (*Result, error) {
+	maxRounds := s.cfg.PolishMaxRounds
+	if maxRounds <= 0 {
+		maxRounds = 3
+	}
+
+	var best *Result
+	feedback := ""
+	for round := 0; round <= maxRounds; round++ {
+		if ctx.Err() != nil {
+			break
+		}
+
+		// Round 0 is the original task. Later rounds re-run the swarm with the
+		// reviewer's feedback appended, so it fixes the specific problems found
+		// rather than redoing work that already passes.
+		runTask := task
+		runPrior := prior
+		if round > 0 {
+			runTask = task + "\n\nFix these issues found by the reviewer in the previous result. Do not redo what already works — only address each point below:\n" + feedback
+			runPrior = nil
+		}
+
+		s.emit(Event{Time: time.Now(), Type: "plan", Detail: fmt.Sprintf("polish round %d/%d", round, maxRounds)})
+
+		res, err := s.Run(ctx, runTask, images, runPrior)
+		if err != nil {
+			if best != nil {
+				return best, nil // keep the last good result on a later-round failure
+			}
+			return nil, err
+		}
+		best = res
+
+		if round >= maxRounds {
+			break
+		}
+
+		v, err := s.review(ctx, task, res)
+		if err != nil {
+			// A failed review isn't fatal: keep the result rather than looping
+			// forever on a reviewer outage.
+			return best, nil
+		}
+		if v.Approved {
+			s.emit(Event{Time: time.Now(), Type: "plan", Detail: "polish approved after round " + fmt.Sprint(round)})
+			return best, nil
+		}
+		feedback = strings.TrimSpace(v.Feedback)
+		if feedback == "" {
+			return best, nil
+		}
+		s.emit(Event{Time: time.Now(), Type: "warning", Agent: "orchestrator", Detail: "reviewer: " + truncate(feedback, 1000)})
+	}
+	return best, nil
+}
+
+// review asks an orchestrator-side model to judge whether the result fully
+// satisfies the task, returning either approval or actionable feedback. It uses
+// the same agent/model selection as planning so mixed-provider swarms review on
+// the same backend they plan on.
+func (s *Swarm) review(ctx context.Context, task string, res *Result) (reviewVerdict, error) {
+	agents := s.cfg.Agents
+	if len(agents) == 0 {
+		return reviewVerdict{}, fmt.Errorf("no agents configured")
+	}
+
+	orchAgent := agents[0]
+	for _, a := range agents {
+		if !isOpenAI(a.Provider) {
+			orchAgent = a
+			break
+		}
+	}
+	model := s.cfg.OrchestratorModel
+	if isOpenAI(orchAgent.Provider) {
+		model = "deepseek-chat"
+	}
+	client, err := s.buildClient(orchAgent, model)
+	if err != nil {
+		return reviewVerdict{}, err
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Task:\n")
+	sb.WriteString(task)
+	sb.WriteString("\n\nWhat the agents produced:\n")
+	sb.WriteString(res.Final)
+	if len(res.Files) > 0 {
+		sb.WriteString("\n\nFiles created:\n")
+		for _, f := range res.Files {
+			sb.WriteString("- " + f.Path + "\n")
+		}
+	}
+
+	prompt := "You are a strict reviewer. Judge whether the work below fully and correctly satisfies the task, with no bugs, no missing pieces and no placeholder or unfinished content. " +
+		"If it is polished and complete, return {\"approved\": true, \"feedback\": \"\"}. " +
+		"Otherwise return {\"approved\": false, \"feedback\": \"<a numbered list of specific, actionable problems to fix>\"}. " +
+		"Return ONLY JSON, no markdown, no extra text.\n\n" + sb.String()
+
+	out, err := client.Generate(ctx, "You are a strict reviewer of a swarm's output.", []llm.Turn{{Role: "user", Text: prompt}}, nil)
+	if err != nil {
+		return reviewVerdict{}, err
+	}
+	s.emit(Event{Time: time.Now(), Type: "usage", Agent: "orchestrator", Model: client.Model(), Usage: out.Usage})
+
+	return parseReview(out.Text)
+}
+
+// parseReview decodes a reviewer's verdict from raw model output, tolerating
+// markdown fences and surrounding prose.
+func parseReview(raw string) (reviewVerdict, error) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+	start := strings.Index(raw, "{")
+	end := strings.LastIndex(raw, "}")
+	if start < 0 || end <= start {
+		return reviewVerdict{}, fmt.Errorf("no JSON object in reviewer output")
+	}
+	var v reviewVerdict
+	if err := json.Unmarshal([]byte(raw[start:end+1]), &v); err != nil {
+		return reviewVerdict{}, err
+	}
+	return v, nil
 }
 
 // execState is the shared state of one continuous scheduling pass. Workers pull
@@ -251,7 +423,7 @@ func newExecState(nAgents int) *execState {
 // barrier — so an agent that finishes early immediately picks up the next
 // runnable step, and every agent stays busy until the work is done. Blocked work
 // is re-decomposed on demand so idle agents have something to do.
-func (s *Swarm) execute(ctx context.Context, orch *llm.Gemini, task string, plan []string, contract string, assignments map[string]string, deps map[int][]int, systemExtra string, agents []Agent) ([]SubtaskResult, []UsageRecord) {
+func (s *Swarm) execute(ctx context.Context, orch llm.Client, task string, plan []string, contract string, assignments map[string]string, deps map[int][]int, systemExtra string, agents []Agent) ([]SubtaskResult, []UsageRecord) {
 	st := newExecState(len(agents))
 	for i, p := range plan {
 		st.jobs[i] = &job{id: i, text: p}
@@ -311,7 +483,7 @@ func (s *Swarm) execute(ctx context.Context, orch *llm.Gemini, task string, plan
 // worker is one agent's scheduling loop: pull a runnable job, run it, and record
 // the result — or become the re-decomposer when the queue has run dry but work
 // remains, so no agent idles while there is still something to do.
-func (s *Swarm) worker(ctx context.Context, orch *llm.Gemini, ag Agent, st *execState, task, contract string, assignments map[string]string, systemExtra string) {
+func (s *Swarm) worker(ctx context.Context, orch llm.Client, ag Agent, st *execState, task, contract string, assignments map[string]string, systemExtra string) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -330,7 +502,7 @@ func (s *Swarm) worker(ctx context.Context, orch *llm.Gemini, ag Agent, st *exec
 		doneText := st.doneSnapshot()
 		prompt := workerPrompt(task, contract, doneText, j.text, s.fileNames())
 
-		s.emit(Event{Time: time.Now(), Type: "subtask", Agent: ag.Name, Model: model, Step: j.id, Wave: round, Detail: truncate(j.text, 140)})
+		s.emit(Event{Time: time.Now(), Type: "subtask", Agent: ag.Name, Model: model, Step: j.id, Wave: round, Detail: j.text})
 
 		// Workers get a text-only prompt: the raw images are sent to the
 		// orchestrator alone (for planning), and image-derived requirements reach
@@ -341,12 +513,12 @@ func (s *Swarm) worker(ctx context.Context, orch *llm.Gemini, ag Agent, st *exec
 		sr := SubtaskResult{Task: j.text, Agent: ag.Name, Model: usedModel, Files: agRes.Files}
 		if aerr != nil {
 			sr.Error = aerr.Error()
-			s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Step: j.id, Wave: round, Detail: "error: " + truncate(aerr.Error(), 240)})
+			s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Step: j.id, Wave: round, Detail: "error: " + aerr.Error()})
 		} else {
 			sr.Summary = agRes.Summary
 			sr.ToolCalls = agRes.ToolCalls
 			sr.Usage = agRes.Usage
-			s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Step: j.id, Wave: round, Detail: truncate(agRes.Summary, 240)})
+			s.emit(Event{Time: time.Now(), Type: "subtask_done", Agent: ag.Name, Model: usedModel, Step: j.id, Wave: round, Detail: agRes.Summary})
 		}
 		st.finish(j.id, sr)
 	}
@@ -460,7 +632,7 @@ func workerPrompt(task, contract, doneText, jobText string, names []string) stri
 // work. It snapshots the still-blocked jobs, asks the orchestrator to split them
 // into finer parallel subtasks, and replaces the blocked jobs with the result so
 // the idle agents have work again.
-func (s *Swarm) redecomposeAndMerge(ctx context.Context, orch *llm.Gemini, st *execState, task, contract string) {
+func (s *Swarm) redecomposeAndMerge(ctx context.Context, orch llm.Client, st *execState, task, contract string) {
 	st.mu.Lock()
 	var remaining []string
 	for id, j := range st.jobs {
@@ -541,7 +713,7 @@ func (st *execState) replaceBlocked(plan []string, deps map[int][]int) {
 // redecompose asks the orchestrator to break a set of remaining (coarse or
 // sequential) work items into finer, maximally-parallel subtasks. It returns the
 // new plan and its dependencies (0-based within the new list).
-func (s *Swarm) redecompose(ctx context.Context, orch *llm.Gemini, task, contract string, remaining []string, done string, minSubtasks int) ([]string, map[int][]int, llm.Usage, error) {
+func (s *Swarm) redecompose(ctx context.Context, orch llm.Client, task, contract string, remaining []string, done string, minSubtasks int) ([]string, map[int][]int, llm.Usage, error) {
 	var b strings.Builder
 	b.WriteString("You are the orchestrator of a swarm of AI agents.\n")
 	b.WriteString("Overall task:\n" + task + "\n\n")
@@ -555,9 +727,8 @@ func (s *Swarm) redecompose(ctx context.Context, orch *llm.Gemini, task, contrac
 	for i, r := range remaining {
 		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, r))
 	}
-	b.WriteString(fmt.Sprintf("\nThere are %d agents that must all stay busy. Split the remaining work into at least %d independent subtasks that can run concurrently, up to as many as genuinely make sense. Chain one subtask after another ONLY when it truly needs the earlier one's output.\n", len(s.cfg.Agents), minSubtasks))
-	b.WriteString("Return ONLY valid JSON — no markdown, no code fences, no extra text — in this shape:\n{\"plan\":[\"subtask 0\",...],\"dependencies\":{\"<index>\":[<prerequisite indices>]}}\n")
-	b.WriteString("Indices are 0-based within this new list. Independent subtasks need no \"dependencies\" entry.\n")
+	b.WriteString(fmt.Sprintf("\nThere are %d agents that must all stay busy. Split the remaining work into at least %d subtasks that are all INDEPENDENT and run concurrently at the same time. Never sequence one after another; if two subtasks must agree on something, capture that agreement in the contract text.\n", len(s.cfg.Agents), minSubtasks))
+	b.WriteString("Return ONLY valid JSON — no markdown, no code fences, no extra text — in this shape:\n{\"plan\":[\"subtask 0\",...]}\n")
 
 	res, err := orch.Generate(ctx, "You are the orchestrator of a swarm of AI agents.", []llm.Turn{{Role: "user", Text: b.String()}}, nil)
 	if err != nil {
@@ -570,15 +741,12 @@ func (s *Swarm) redecompose(ctx context.Context, orch *llm.Gemini, task, contrac
 	if o.Direct || len(o.Plan) == 0 {
 		return nil, nil, llm.Usage{}, fmt.Errorf("re-decomposition returned no plan")
 	}
-	if o.Dependencies == nil {
-		o.Dependencies = map[int][]int{}
-	}
-	return o.Plan, o.Dependencies, res.Usage, nil
+	return o.Plan, map[int][]int{}, res.Usage, nil
 }
 
 // expand re-decomposes a coarse initial plan (fewer subtasks than agents) into
 // enough parallel subtasks for every agent, before any execution starts.
-func (s *Swarm) expand(ctx context.Context, orch *llm.Gemini, task, contract string, plan []string, agents []Agent) ([]string, map[int][]int, llm.Usage, error) {
+func (s *Swarm) expand(ctx context.Context, orch llm.Client, task, contract string, plan []string, agents []Agent) ([]string, map[int][]int, llm.Usage, error) {
 	return s.redecompose(ctx, orch, task, contract, plan, "", len(agents))
 }
 
@@ -629,7 +797,11 @@ func (s *Swarm) finalize(ctx context.Context, a Agent, task string, subs []Subta
 			"Write a concise, human-readable answer to the user describing what was done and the result. Mention any files created and how to use them. Reply in the same language as the task.",
 		task, sb.String())
 
-	client, err := s.buildClient(a, s.cfg.DefaultModel)
+	model := s.cfg.DefaultModel
+	if isOpenAI(a.Provider) {
+		model = "deepseek-chat"
+	}
+	client, err := s.buildClient(a, model)
 	if err != nil {
 		return "", "", llm.Usage{}, err
 	}
@@ -713,7 +885,7 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-func (s *Swarm) plan(ctx context.Context, orch *llm.Gemini, task string, images []llm.Image, prior []llm.Turn) (orchestration, llm.Usage, error) {
+func (s *Swarm) plan(ctx context.Context, orch llm.Client, task string, images []llm.Image, prior []llm.Turn) (orchestration, llm.Usage, error) {
 	names := make([]string, 0, len(s.cfg.Agents))
 	for _, a := range s.cfg.Agents {
 		names = append(names, a.Name)
@@ -730,12 +902,11 @@ func (s *Swarm) plan(ctx context.Context, orch *llm.Gemini, task string, images 
 			"First decide whether this task needs a swarm at all.\n"+
 			"- If the task is trivial or conversational — a greeting, small talk, a simple question, or anything a single assistant can answer directly with no tools, no files and no multi-step work — return ONLY:\n"+
 			"  {\"direct\": true, \"answer\": \"<your reply, in the same language as the task>\"}\n"+
-			"- Otherwise break the task into concrete subtasks. KEEP EVERY AGENT BUSY: split the work into at least %d independent subtasks (one per agent) and more — up to %d — wherever the task naturally decomposes further. Prefer subtasks that can run in parallel; chain a subtask after another ONLY when it truly needs the earlier one's output, and record that ordering in \"dependencies\". Never serialize work that could be parallel.\n"+
+			"- Otherwise break the task into concrete subtasks that ALL run in parallel at the same time. KEEP EVERY AGENT BUSY: produce at least %d subtasks (one per agent) and more — up to %d — wherever the work decomposes further. Every subtask is INDEPENDENT and starts at once: never sequence one after another and never add ordering or dependencies. If two subtasks must agree on something, put that agreement in the contract (exact file paths, IDs, class names, signatures) instead of chaining them.\n"+
 			"  Write a short technical CONTRACT that every subtask must obey: the exact file paths to create, shared identifiers (IDs, CSS class names), and function/API signatures, so all subtasks integrate cleanly and never collide or diverge.\n"+
 			"  Choose the best model for each agent in \"assignments\".\n"+
 			"  Return ONLY:\n"+
-			"  {\"plan\": [\"subtask 0\", ...], \"contract\": \"<shared paths, IDs, classes, signatures>\", \"assignments\": {\"<agent name>\": \"<model>\"}, \"dependencies\": {\"<subtask index>\": [<prerequisite indices>]}}.\n"+
-			"  The \"dependencies\" field maps a subtask's index (as a string) to the list of indices it must wait for. Independent subtasks have no entry, so \"dependencies\" may be {}.\n"+
+			"  {\"plan\": [\"subtask 0\", ...], \"contract\": \"<shared paths, IDs, classes, signatures>\", \"assignments\": {\"<agent name>\": \"<model>\"}}.\n"+
 			"No markdown, no code fences, no extra text.",
 		strings.Join(names, ", "), strings.Join(s.cfg.AvailableModels, ", "), task, len(names), max)
 
@@ -771,13 +942,12 @@ func formatHistory(history []llm.Turn) string {
 	return strings.TrimSpace(sb.String())
 }
 
-func (s *Swarm) buildClient(a Agent, model string) (*llm.Gemini, error) {
+func (s *Swarm) buildClient(a Agent, model string) (llm.Client, error) {
 	cfg := llm.Config{
-		BaseURL:        a.BaseURL,
-		APIKey:         a.APIKey,
-		Model:          model,
-		FallbackModels: downgradeFallbacks(model, s.cfg.AvailableModels),
-		Proxy:          a.Proxy,
+		BaseURL: a.BaseURL,
+		APIKey:  a.APIKey,
+		Model:   model,
+		Proxy:   a.Proxy,
 	}
 	if s.cfg.TransportCache != nil {
 		tr, err := s.cfg.TransportCache.Get(a.Proxy)
@@ -786,6 +956,10 @@ func (s *Swarm) buildClient(a Agent, model string) (*llm.Gemini, error) {
 		}
 		cfg.Transport = tr
 	}
+	if isOpenAI(a.Provider) {
+		return llm.NewOpenAI(cfg)
+	}
+	cfg.FallbackModels = downgradeFallbacks(model, s.cfg.AvailableModels)
 	return llm.New(cfg)
 }
 
@@ -819,7 +993,7 @@ func downgradeFallbacks(primary string, available []string) []string {
 // client also downgrades in-request on 429 quota exhaustion (see llm.Gemini).
 func (s *Swarm) runWorker(ctx context.Context, a Agent, model, systemExtra string, history []llm.Turn) (agent.Result, string, error) {
 	var lastErr error
-	for _, m := range modelChain(model, s.cfg.DefaultModel, s.cfg.AvailableModels) {
+	for _, m := range s.chainFor(a, model) {
 		client, err := s.buildClient(a, m)
 		if err != nil {
 			lastErr = err
@@ -830,6 +1004,7 @@ func (s *Swarm) runWorker(ctx context.Context, a Agent, model, systemExtra strin
 			Workspace:     s.cfg.Workspace,
 			Browser:       s.cfg.Browser,
 			Desktop:       s.cfg.Desktop,
+			Proxy:         a.Proxy,
 			Log:           s.workerLog(a, client),
 			OnUsage:       s.usageLog(a, client),
 			DisabledTools: agent.DisabledToolNames(s.cfg.DisabledModules),
@@ -859,9 +1034,22 @@ func modelChain(assigned, def string, available []string) []string {
 	return out
 }
 
+// chainFor returns the model chain for one agent, keeping OpenAI-compatible
+// backends on their own model namespace (deepseek-*) instead of mixing in
+// Gemini fallbacks.
+func (s *Swarm) chainFor(a Agent, assigned string) []string {
+	if isOpenAI(a.Provider) {
+		if strings.TrimSpace(assigned) == "" {
+			return []string{"deepseek-chat"}
+		}
+		return []string{assigned}
+	}
+	return modelChain(assigned, s.cfg.DefaultModel, s.cfg.AvailableModels)
+}
+
 // workerLog adapts an agent's tool-call log into swarm progress events, reading
 // the client's current model so downgraded requests are attributed correctly.
-func (s *Swarm) workerLog(a Agent, client *llm.Gemini) func(kind, tool, detail string) {
+func (s *Swarm) workerLog(a Agent, client llm.Client) func(kind, tool, detail string) {
 	return func(kind, tool, detail string) {
 		e := Event{Time: time.Now(), Type: kind, Agent: a.Name, Model: client.Model(), Tool: tool, Detail: detail}
 		if kind == "tool" {
@@ -889,7 +1077,7 @@ func DirectionFor(tool string) string {
 }
 
 // usageLog emits a per-call usage event so token spend is visible in real time.
-func (s *Swarm) usageLog(a Agent, client *llm.Gemini) func(llm.Usage) {
+func (s *Swarm) usageLog(a Agent, client llm.Client) func(llm.Usage) {
 	return func(u llm.Usage) {
 		s.emit(Event{Time: time.Now(), Type: "usage", Agent: a.Name, Model: client.Model(), Usage: u})
 	}
@@ -904,6 +1092,9 @@ func resolveModel(a Agent, assignments map[string]string, defaultModel string) s
 	}
 	if m, ok := assignments[a.Slug]; ok && m != "" {
 		return m
+	}
+	if isOpenAI(a.Provider) {
+		return "deepseek-chat"
 	}
 	return defaultModel
 }

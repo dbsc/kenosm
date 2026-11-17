@@ -15,7 +15,7 @@ import (
 // ErrNotFound is returned when a service does not exist.
 var ErrNotFound = errors.New("service not found")
 
-const serviceColumns = "id, slug, name, upstream_url, upstream_api_key, auth_header, auth_scheme, proxy_host, proxy_port, proxy_username, proxy_password, model, enabled, created_at, updated_at"
+const serviceColumns = "id, slug, name, upstream_url, upstream_api_key, auth_header, auth_scheme, provider, proxy_host, proxy_port, proxy_username, proxy_password, model, enabled, created_at, updated_at"
 
 // ServiceRepo provides persistence for Service records, encrypting and
 // decrypting secrets transparently.
@@ -40,11 +40,11 @@ func (r *ServiceRepo) Create(ctx context.Context, svc model.Service) (model.Serv
 
 	row := r.pool.QueryRow(ctx,
 		`INSERT INTO services
-			(slug, name, upstream_url, upstream_api_key, auth_header, auth_scheme,
+			(slug, name, upstream_url, upstream_api_key, auth_header, auth_scheme, provider,
 			 proxy_host, proxy_port, proxy_username, proxy_password, model, enabled)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 		 RETURNING `+serviceColumns,
-		svc.Slug, svc.Name, svc.UpstreamURL, encKey, svc.AuthHeader, svc.AuthScheme,
+		svc.Slug, svc.Name, svc.UpstreamURL, encKey, svc.AuthHeader, svc.AuthScheme, svc.Provider,
 		svc.ProxyHost, svc.ProxyPort, svc.ProxyUsername, encPass, svc.Model, svc.Enabled,
 	)
 	return scanService(row, r.cipher, true)
@@ -120,11 +120,11 @@ func (r *ServiceRepo) Update(ctx context.Context, svc model.Service) (model.Serv
 	row := r.pool.QueryRow(ctx,
 		`UPDATE services SET
 			slug = $2, name = $3, upstream_url = $4, upstream_api_key = $5,
-			auth_header = $6, auth_scheme = $7, proxy_host = $8, proxy_port = $9,
-			proxy_username = $10, proxy_password = $11, model = $12, enabled = $13, updated_at = now()
+			auth_header = $6, auth_scheme = $7, provider = $8, proxy_host = $9, proxy_port = $10,
+			proxy_username = $11, proxy_password = $12, model = $13, enabled = $14, updated_at = now()
 		 WHERE id = $1
 		 RETURNING `+serviceColumns,
-		uid, svc.Slug, svc.Name, svc.UpstreamURL, encKey, svc.AuthHeader, svc.AuthScheme,
+		uid, svc.Slug, svc.Name, svc.UpstreamURL, encKey, svc.AuthHeader, svc.AuthScheme, svc.Provider,
 		svc.ProxyHost, svc.ProxyPort, svc.ProxyUsername, encPass, svc.Model, svc.Enabled,
 	)
 	return scanService(row, r.cipher, true)
@@ -159,7 +159,7 @@ func scanService(row pgx.Row, c *crypto.Cipher, withSecrets bool) (model.Service
 	var svc model.Service
 	var encKey, encPass string
 	err := row.Scan(
-		&svc.ID, &svc.Slug, &svc.Name, &svc.UpstreamURL, &encKey, &svc.AuthHeader, &svc.AuthScheme,
+		&svc.ID, &svc.Slug, &svc.Name, &svc.UpstreamURL, &encKey, &svc.AuthHeader, &svc.AuthScheme, &svc.Provider,
 		&svc.ProxyHost, &svc.ProxyPort, &svc.ProxyUsername, &encPass, &svc.Model, &svc.Enabled, &svc.CreatedAt, &svc.UpdatedAt,
 	)
 	if err != nil {

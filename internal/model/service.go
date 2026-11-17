@@ -15,6 +15,7 @@ type Service struct {
 	UpstreamAPIKey   string    `json:"-"`
 	AuthHeader       string    `json:"auth_header"`
 	AuthScheme       string    `json:"auth_scheme"`
+	Provider         string    `json:"provider"` // "gemini" (default) or "openai" (DeepSeek etc.)
 	ProxyHost        string    `json:"proxy_host"`
 	ProxyPort        int       `json:"proxy_port"`
 	ProxyUsername    string    `json:"proxy_username"`

@@ -111,6 +111,7 @@ function renderAgents() {
     <div class="card">
       <div class="meta">
         <div class="name">${esc(a.name || a.slug)} <span class="badge">${esc(a.slug)}</span>
+          <span class="badge">${a.provider === "openai" || a.provider === "deepseek" ? "deepseek" : "gemini"}</span>
           ${a.enabled ? "" : '<span class="badge">disabled</span>'}</div>
         <div class="sub">model: ${esc(a.model || "auto")} | proxy: ${esc(a.proxy_host)}:${a.proxy_port} | key: ${a.has_api_key ? "set" : "not set"}</div>
       </div>
@@ -128,7 +129,9 @@ function openNewAgent() {
   editingId = null;
   $("#agent-form-title").textContent = "Add agent";
   ["f-name", "f-slug", "f-baseurl", "f-model", "f-key", "f-phost", "f-pport", "f-puser", "f-ppass"].forEach((id) => ($("#" + id).value = ""));
+  $("#f-provider").value = "gemini";
   $("#f-baseurl").value = "https://generativelanguage.googleapis.com/v1beta";
+  $("#f-model").placeholder = "auto";
   $("#f-enabled").checked = true;
   $("#agent-form").classList.remove("hidden");
 }
@@ -142,6 +145,8 @@ function editAgent(id) {
   $("#f-slug").value = a.slug || "";
   $("#f-baseurl").value = a.upstream_url || "";
   $("#f-model").value = a.model || "";
+  $("#f-provider").value = a.provider === "openai" || a.provider === "deepseek" ? "openai" : "gemini";
+  $("#f-model").placeholder = a.provider === "openai" || a.provider === "deepseek" ? "deepseek-chat" : "auto";
   $("#f-key").value = "";
   $("#f-phost").value = a.proxy_host || "";
   $("#f-pport").value = a.proxy_port || "";
@@ -154,17 +159,20 @@ function editAgent(id) {
 async function saveAgent() {
   const name = $("#f-name").value.trim();
   const slug = ($("#f-slug").value.trim() || name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""));
+  const provider = $("#f-provider").value === "openai" ? "openai" : "gemini";
   const body = {
     name,
     slug,
     upstream_url: $("#f-baseurl").value.trim(),
-    auth_header: "x-goog-api-key",
-    model: $("#f-model").value.trim(),
+    provider,
+    auth_header: provider === "openai" ? "Authorization" : "x-goog-api-key",
+    model: $("#f-model").value.trim() || (provider === "openai" ? "deepseek-chat" : ""),
     proxy_host: $("#f-phost").value.trim(),
     proxy_port: parseInt($("#f-pport").value, 10) || 0,
     proxy_username: $("#f-puser").value.trim(),
     enabled: $("#f-enabled").checked,
   };
+  if (provider === "openai") body.auth_scheme = "Bearer";
   if ($("#f-key").value) body.upstream_api_key = $("#f-key").value;
   if ($("#f-ppass").value) body.proxy_password = $("#f-ppass").value;
 
@@ -257,10 +265,12 @@ let currentMode = "single";
 let currentRunId = null;
 let currentES = null;
 
-// Swarm graph state: one fixed orchestrator node plus a node per agent, laid out
-// on a ring around it. Signals (lines) fly between nodes on SSE events.
+// Swarm graph state: one node per agent, laid out on a ring. Signals (lines)
+// fly on SSE events: the planner dispatches work from the centre, and a finished
+// agent broadcasts its result to the others.
 const swarmNodes = new Map(); // agent name -> {x, y}
-const swarmOrch = { x: 110, y: 110 };
+const swarmCenter = { x: 124, y: 124 };
+const swarmRadius = 82;
 const SVGNS = "http://www.w3.org/2000/svg";
 
 function setRunning(running) {
@@ -273,6 +283,7 @@ function setMode(mode) {
   currentMode = mode;
   $("#btn-mode-single").classList.toggle("active", mode === "single");
   $("#btn-mode-swarm").classList.toggle("active", mode === "swarm");
+  $("#btn-mode-polish").classList.toggle("active", mode === "polish");
 }
 
 // ---- chat list ----
@@ -296,6 +307,7 @@ async function newChat() {
   setMode(c.mode || "single");
   renderChatTabs();
   renderMessages([]);
+  clearLiveFeed();
 }
 
 function renderChatTabs() {
@@ -630,7 +642,8 @@ function renderCostBars(rows) {
     .join("");
 }
 
-// liveFeed appends real-time activity from the running swarm's SSE stream.
+// liveFeed appends tool activity (reads/writes) and token usage from the
+// running swarm's SSE stream. Orchestration/communication goes to swarmComm().
 function liveFeed(e) {
   let label = "";
   switch (e.type) {
@@ -642,24 +655,6 @@ function liveFeed(e) {
       break;
     case "tool":
       label = (e.agent || "") + " " + (e.direction === "write" ? "WRITE" : e.direction === "read" ? "READ" : "·") + " " + (e.tool || "") + (e.detail ? " " + e.detail : "");
-      break;
-    case "subtask":
-      label = (e.agent || "") + " → " + (e.detail || "");
-      break;
-    case "subtask_done":
-      label = (e.agent || "") + " ✓ " + ((e.detail || "").slice(0, 48) || "done");
-      break;
-    case "direct":
-      label = (e.agent || "") + " → " + (e.detail || "");
-      break;
-    case "warning":
-      label = "! " + (e.detail || "");
-      break;
-    case "done":
-      label = "run complete";
-      break;
-    case "error":
-      label = "error: " + (e.error || e.detail || "");
       break;
     default:
       return;
@@ -685,25 +680,28 @@ function clearLiveFeed() {
 
 // ---------- Swarm graph + agents-talking transcript ----------
 function swarmShort(name) {
-  const parts = String(name || "?").trim().split(/\s+/).filter(Boolean);
-  if (!parts.length) return "?";
-  if (parts.length === 1) return parts[0].slice(0, 7);
-  return (parts[0] + " " + parts[parts.length - 1]).slice(0, 9);
+  const words = String(name || "?").trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return "?";
+  const key = words.length > 1 ? words[words.length - 1] : words[0];
+  return key.slice(0, 3).toUpperCase();
 }
 
-function swarmNode(svg, x, y, label, isOrch) {
+function swarmNode(svg, name, x, y) {
   const g = document.createElementNS(SVGNS, "g");
-  g.setAttribute("class", isOrch ? "swarm-node swarm-node-orch" : "swarm-node swarm-node-agent");
+  const title = document.createElementNS(SVGNS, "title");
+  title.textContent = name;
+  g.appendChild(title);
   const c = document.createElementNS(SVGNS, "circle");
   c.setAttribute("cx", x);
   c.setAttribute("cy", y);
-  c.setAttribute("r", isOrch ? 20 : 17);
+  c.setAttribute("r", 22);
+  c.setAttribute("class", "swarm-node");
   g.appendChild(c);
   const t = document.createElementNS(SVGNS, "text");
   t.setAttribute("x", x);
   t.setAttribute("y", y);
-  t.setAttribute("class", isOrch ? "swarm-label-orch" : "swarm-label-agent");
-  t.textContent = label;
+  t.setAttribute("class", "swarm-label");
+  t.textContent = swarmShort(name);
   g.appendChild(t);
   svg.appendChild(g);
 }
@@ -713,41 +711,53 @@ function renderSwarmGraph() {
   if (!el) return;
   el.innerHTML = "";
   const svg = document.createElementNS(SVGNS, "svg");
-  svg.setAttribute("viewBox", "0 0 220 220");
+  svg.setAttribute("viewBox", "0 0 248 248");
   svg.setAttribute("class", "swarm-svg");
   svg.setAttribute("role", "img");
   svg.setAttribute("aria-label", "swarm agents");
-  swarmNode(svg, swarmOrch.x, swarmOrch.y, "orch", true);
   const names = [...swarmNodes.keys()];
   names.forEach((n, i) => {
     const ang = (i / Math.max(1, names.length)) * Math.PI * 2 - Math.PI / 2;
-    const x = swarmOrch.x + Math.cos(ang) * 80;
-    const y = swarmOrch.y + Math.sin(ang) * 80;
+    const x = swarmCenter.x + Math.cos(ang) * swarmRadius;
+    const y = swarmCenter.y + Math.sin(ang) * swarmRadius;
     swarmNodes.set(n, { x, y });
-    swarmNode(svg, x, y, swarmShort(n), false);
+    swarmNode(svg, n, x, y);
   });
   el.appendChild(svg);
 }
 
 function swarmPos(name) {
-  if (name === "orchestrator" || name === "orch") return swarmOrch;
   return swarmNodes.get(name) || null;
 }
 
-function swarmSignal(from, to) {
+// Draws a signal line between two points, fading out after a second.
+function swarmLine(x1, y1, x2, y2) {
   const svg = $("#swarm-graph svg");
   if (!svg) return;
-  const a = swarmPos(from);
-  const b = swarmPos(to);
-  if (!a || !b) return;
   const line = document.createElementNS(SVGNS, "line");
-  line.setAttribute("x1", a.x);
-  line.setAttribute("y1", a.y);
-  line.setAttribute("x2", b.x);
-  line.setAttribute("y2", b.y);
+  line.setAttribute("x1", x1);
+  line.setAttribute("y1", y1);
+  line.setAttribute("x2", x2);
+  line.setAttribute("y2", y2);
   line.setAttribute("class", "swarm-signal");
   svg.appendChild(line);
   setTimeout(() => line.remove(), 1000);
+}
+
+// The planner hands work out from the centre of the ring.
+function swarmDispatch(name) {
+  const p = swarmPos(name);
+  if (!p) return;
+  swarmLine(swarmCenter.x, swarmCenter.y, p.x, p.y);
+}
+
+// A finished agent shares its result with every other agent (the shared log).
+function swarmBroadcast(name) {
+  const p = swarmPos(name);
+  if (!p) return;
+  swarmNodes.forEach((q, other) => {
+    if (other !== name) swarmLine(p.x, p.y, q.x, q.y);
+  });
 }
 
 function swarmPulse(name) {
@@ -758,27 +768,29 @@ function swarmPulse(name) {
   const c = document.createElementNS(SVGNS, "circle");
   c.setAttribute("cx", p.x);
   c.setAttribute("cy", p.y);
-  c.setAttribute("r", 17);
+  c.setAttribute("r", 22);
   c.setAttribute("class", "swarm-pulse");
   svg.appendChild(c);
   setTimeout(() => c.remove(), 800);
 }
 
 // swarmComm drives the circle graph and the "agents talking" transcript. It runs
-// alongside liveFeed() on every SSE event from a running run.
+// alongside liveFeed() on every SSE event from a running run. The transcript is
+// chronological (oldest first) so it reads like a conversation, auto-scrolled to
+// the newest line.
 function swarmComm(e) {
   const name = e.agent || "";
   if (name && !swarmNodes.has(name)) {
-    swarmNodes.set(name, { x: swarmOrch.x, y: swarmOrch.y });
+    swarmNodes.set(name, { x: swarmCenter.x, y: swarmCenter.y });
     renderSwarmGraph();
   }
 
   switch (e.type) {
     case "subtask":
-      if (name) swarmSignal("orchestrator", name); // orchestrator hands out work
+      if (name) swarmDispatch(name); // planner hands out work
       break;
     case "subtask_done":
-      if (name) swarmSignal(name, "orchestrator"); // agent reports back
+      if (name) swarmBroadcast(name); // agent shares its result with everyone
       break;
     case "tool":
       if (name) swarmPulse(name); // agent is actively working
@@ -789,7 +801,7 @@ function swarmComm(e) {
   let cls = "comm-sys";
   switch (e.type) {
     case "planning":
-      label = "orchestrator is planning…";
+      label = e.detail || "orchestrator is planning…";
       break;
     case "plan":
       label = "orchestrator → " + (e.detail || "plan ready");
@@ -805,10 +817,12 @@ function swarmComm(e) {
       cls = "comm-task";
       break;
     }
-    case "subtask_done":
-      label = name + " done: " + String(e.detail || "ok").slice(0, 140);
+    case "subtask_done": {
+      const step = e.step != null ? " [step " + e.step + "]" : "";
+      label = name + step + " done: " + (e.detail || "ok");
       cls = "comm-done";
       break;
+    }
     case "warning":
       label = "warning: " + (e.detail || "");
       break;
@@ -829,8 +843,9 @@ function swarmComm(e) {
   const line = document.createElement("div");
   line.className = "comm-line " + cls;
   line.textContent = label;
-  el.prepend(line);
-  while (el.children.length > 100) el.removeChild(el.lastChild);
+  el.appendChild(line);
+  while (el.children.length > 300) el.removeChild(el.firstChild);
+  el.scrollTop = el.scrollHeight;
 }
 
 function renderGroup(rows) {
@@ -932,11 +947,19 @@ function hideModal() {
 $("#btn-new-agent").addEventListener("click", openNewAgent);
 $("#btn-save-agent").addEventListener("click", saveAgent);
 $("#btn-cancel-agent").addEventListener("click", () => $("#agent-form").classList.add("hidden"));
+$("#f-provider").addEventListener("change", () => {
+  const openai = $("#f-provider").value === "openai";
+  const cur = $("#f-baseurl").value;
+  if (openai && (!cur || cur.includes("generativelanguage"))) $("#f-baseurl").value = "https://api.deepseek.com";
+  if (!openai && (!cur || cur.includes("deepseek"))) $("#f-baseurl").value = "https://generativelanguage.googleapis.com/v1beta";
+  $("#f-model").placeholder = openai ? "deepseek-chat" : "auto";
+});
 $("#btn-run").addEventListener("click", sendMessage);
 $("#btn-stop").addEventListener("click", stopRun);
 $("#btn-new-chat").addEventListener("click", newChat);
 $("#btn-mode-single").addEventListener("click", () => setMode("single"));
 $("#btn-mode-swarm").addEventListener("click", () => setMode("swarm"));
+$("#btn-mode-polish").addEventListener("click", () => setMode("polish"));
 $("#timeline-run").addEventListener("change", () => {
   timelineRunId = $("#timeline-run").value;
   if (timelineRunId) loadTimeline(timelineRunId);

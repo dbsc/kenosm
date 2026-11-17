@@ -315,3 +315,32 @@ func TestExecStateConcurrentWorkers(t *testing.T) {
 		t.Fatalf("results = %d, want %d", len(st.results), jobs)
 	}
 }
+
+func TestParseReviewApproved(t *testing.T) {
+	v, err := parseReview("```json\n{\"approved\": true, \"feedback\": \"\"}\n```")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !v.Approved {
+		t.Fatalf("approved = false, want true")
+	}
+}
+
+func TestParseReviewFeedback(t *testing.T) {
+	v, err := parseReview("The work is not done. {\"approved\": false, \"feedback\": \"1. fix the CSS\\n2. wire the API\"}")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if v.Approved {
+		t.Fatalf("approved = true, want false")
+	}
+	if !strings.Contains(v.Feedback, "fix the CSS") {
+		t.Fatalf("feedback = %q", v.Feedback)
+	}
+}
+
+func TestParseReviewInvalid(t *testing.T) {
+	if _, err := parseReview("no json here"); err == nil {
+		t.Fatalf("expected error for non-JSON reviewer output")
+	}
+}

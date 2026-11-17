@@ -111,7 +111,7 @@ func main() {
 
 	admin := handler.NewAdmin(serviceRepo)
 	gateway := handler.NewGateway(serviceRepo, transportCache, reqLogger)
-	swarmHandler := handler.NewSwarm(serviceRepo, usageRepo, chatRepo, cfg.OrchestratorModel, cfg.GeminiModel, cfg.AvailableModels, ws, br, dsk, cfg.Prices, activityRepo, transportCache, cfg.DisabledModules, cfg.MaxConcurrentRuns)
+	swarmHandler := handler.NewSwarm(serviceRepo, usageRepo, chatRepo, cfg.OrchestratorModel, cfg.GeminiModel, cfg.AvailableModels, ws, br, dsk, cfg.Prices, activityRepo, transportCache, cfg.DisabledModules, cfg.MaxConcurrentRuns, cfg.PolishMaxRounds)
 	wsHandler := handler.NewWorkspace(ws)
 	statsHandler := handler.NewStats(usageRepo)
 	activityHandler := handler.NewActivity(activityRepo)

@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/chromedp/chromedp"
+
+	"kenosm/internal/transport"
 )
 
 // Config configures a headless browser used to drive and screenshot pages.
@@ -57,9 +61,10 @@ type Session struct {
 	timeout time.Duration
 }
 
-// NewSession launches a headless browser and returns a session bound to parent.
-// The browser process is torn down when parent is canceled (or Close is called).
-func (b *Browser) NewSession(parent context.Context) (*Session, error) {
+// NewSession launches a headless browser bound to parent and routed through the
+// given SOCKS5 proxy (empty proxy = direct connection). The browser process is
+// torn down when parent is canceled (or Close is called).
+func (b *Browser) NewSession(parent context.Context, proxy transport.ProxySpec) (*Session, error) {
 	opts := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
 	opts = append(opts,
 		chromedp.ExecPath(b.bin),
@@ -70,23 +75,44 @@ func (b *Browser) NewSession(parent context.Context) (*Session, error) {
 		chromedp.UserAgent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
 	)
 
+	// Route the browser through the agent's own SOCKS5 proxy. Chromium cannot
+	// supply SOCKS5 credentials via --proxy-server, so when the proxy needs auth
+	// a tiny local relay injects them.
+	var relay *socksRelay
+	if proxy.Host != "" {
+		server := "socks5://" + net.JoinHostPort(proxy.Host, strconv.Itoa(proxy.Port))
+		if proxy.Username != "" || proxy.Password != "" {
+			r, err := startSocksRelay(proxy)
+			if err != nil {
+				return nil, fmt.Errorf("start socks relay: %w", err)
+			}
+			relay = r
+			server = "socks5://" + r.addr()
+		}
+		opts = append(opts, chromedp.Flag("proxy-server", server))
+	}
+
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(parent, opts...)
 	ctx, cancelCtx := chromedp.NewContext(allocCtx, chromedp.WithLogf(func(string, ...any) {}))
+
+	closeAll := func() {
+		cancelCtx()
+		cancelAlloc()
+		if relay != nil {
+			relay.close()
+		}
+	}
 
 	s := &Session{
 		ctx:     ctx,
 		timeout: b.timeout,
-		cancel: func() {
-			cancelCtx()
-			cancelAlloc()
-		},
+		cancel:  closeAll,
 	}
 
 	// Start the browser now, bound to the long-lived ctx, so that per-action
 	// timeouts below never tear the whole browser down (see NewContext docs).
 	if err := chromedp.Do(ctx); err != nil {
-		cancelCtx()
-		cancelAlloc()
+		closeAll()
 		return nil, err
 	}
 	return s, nil

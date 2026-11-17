@@ -11,15 +11,17 @@ import (
 	"kenosm/internal/browser"
 	"kenosm/internal/desktop"
 	"kenosm/internal/llm"
+	"kenosm/internal/transport"
 	"kenosm/internal/workspace"
 )
 
 // Config configures an autonomous tool-using agent.
 type Config struct {
-	LLM           *llm.Gemini
+	LLM           llm.Client
 	Workspace     *workspace.Workspace
 	Browser       *browser.Browser // optional; enables the browser_* tools
 	Desktop       *desktop.Desktop // optional; enables the desktop_* tools
+	Proxy         transport.ProxySpec // optional; the agent's own SOCKS5 proxy (per-agent browser)
 	MaxIterations int
 	// DisabledTools lists tool names to exclude from the agent, even when their
 	// module is otherwise available. Empty = enable every available tool.
@@ -76,7 +78,7 @@ func Modules() []Module {
 		{Name: "files", Label: "Files — read & write code", Tools: toolNamesOf(fileTools()), Optional: false},
 		{Name: "shell", Label: "Shell — run commands", Tools: toolNamesOf(shellTools()), Optional: false},
 		{Name: "browser", Label: "Browser — browse & click", Tools: toolNamesOf(browserTools()), Optional: true},
-		{Name: "desktop", Label: "Desktop — screenshots & input", Tools: toolNamesOf(desktopTools()), Optional: true},
+		{Name: "desktop", Label: "Desktop — screenshots", Tools: toolNamesOf(desktopTools()), Optional: true},
 	}
 }
 
@@ -100,10 +102,11 @@ func DisabledToolNames(disabledModules []string) []string {
 // calls (write files, read files, list files, run commands, drive a browser,
 // control the desktop), and feeds results back until the model finishes.
 type Agent struct {
-	llm         *llm.Gemini
+	llm         llm.Client
 	ws          *workspace.Workspace
 	browser     *browser.Browser
 	desktop     *desktop.Desktop
+	proxy       transport.ProxySpec
 	session     *browser.Session
 	runCtx      context.Context
 	maxIt       int
@@ -146,7 +149,7 @@ func New(cfg Config) *Agent {
 	addModule(cfg.Browser != nil, browserTools())
 	addModule(cfg.Desktop != nil, desktopTools())
 
-	return &Agent{llm: cfg.LLM, ws: cfg.Workspace, browser: cfg.Browser, desktop: cfg.Desktop, maxIt: maxIt, tools: tools, log: cfg.Log, onUsage: cfg.OnUsage, systemExtra: cfg.SystemExtra}
+	return &Agent{llm: cfg.LLM, ws: cfg.Workspace, browser: cfg.Browser, desktop: cfg.Desktop, proxy: cfg.Proxy, maxIt: maxIt, tools: tools, log: cfg.Log, onUsage: cfg.OnUsage, systemExtra: cfg.SystemExtra}
 }
 
 func (a *Agent) Run(ctx context.Context, task string, images []llm.Image) (Result, error) {
@@ -261,7 +264,7 @@ func (a *Agent) systemPrompt() string {
 		caps = append(caps, "drive a real web browser (navigate, click, type, scroll, read page text, and screenshot)")
 	}
 	if hasDesktop {
-		caps = append(caps, "control the desktop (launch programs, manage windows, move and click the mouse, type, and screenshot)")
+		caps = append(caps, "take screenshots of the desktop")
 	}
 	if len(caps) > 0 {
 		b.WriteString("\nYou have tools to " + strings.Join(caps, "; ") + ".")
@@ -279,7 +282,7 @@ When you build a web page or any UI, verify it in the browser before finishing: 
 	}
 	if hasDesktop {
 		b.WriteString(`
-When you launch a desktop program, verify it actually opened by taking a screenshot (desktop_screenshot), and screenshot each interaction (desktop_click, desktop_type, desktop_key and desktop_scroll capture a screenshot automatically) so you can confirm the result. Use desktop_windows to find a window and desktop_focus to bring it to the front.`)
+You can observe the desktop via screenshots: use desktop_windows to list visible windows and desktop_screenshot to capture the whole screen or a specific window.`)
 	}
 	if hasFiles {
 		b.WriteString(`
@@ -365,7 +368,7 @@ func (a *Agent) bsession() (*browser.Session, error) {
 	if a.browser == nil {
 		return nil, fmt.Errorf("no browser available")
 	}
-	s, err := a.browser.NewSession(a.runCtx)
+	s, err := a.browser.NewSession(a.runCtx, a.proxy)
 	if err != nil {
 		return nil, err
 	}
@@ -772,30 +775,11 @@ func browserTools() []Tool {
 }
 
 // desktopTools returns the desktop tools (enabled when a Desktop is available).
+// Computer control (launching programs, mouse, keyboard) is intentionally
+// removed: agents can only observe the desktop via screenshots and window lists.
 func desktopTools() []Tool {
 	return []Tool{
-		tool("desktop_launch", "Launch a program on the desktop (detached). Returns the PID and a screenshot.",
-			map[string]any{
-				"type": "OBJECT",
-				"properties": map[string]any{
-					"program": map[string]any{"type": "STRING", "description": "Program name or path, e.g. \"xterm\" or \"/usr/bin/firefox\""},
-					"args":    map[string]any{"type": "ARRAY", "items": map[string]any{"type": "STRING"}, "description": "Command-line arguments (optional)"},
-					"workdir": map[string]any{"type": "STRING", "description": "Working directory (optional)"},
-				},
-				"required": []any{"program"},
-			},
-			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
-				program := strings.TrimSpace(strVal(c.Args["program"]))
-				if program == "" {
-					return a.resp(c, map[string]any{"error": "desktop_launch requires a program"})
-				}
-				pid, err := a.desktop.Launch(program, strSlice(c.Args["args"]), strVal(c.Args["workdir"]))
-				if err != nil {
-					return a.resp(c, map[string]any{"error": err.Error()})
-				}
-				return a.deskShotResp(c, map[string]any{"ok": true, "pid": pid, "program": program})
-			}),
-		tool("desktop_windows", "List visible desktop windows (id + title) so you can pick one to focus or screenshot.",
+		tool("desktop_windows", "List visible desktop windows (id + title) so you can pick one to screenshot.",
 			map[string]any{"type": "OBJECT", "properties": map[string]any{}},
 			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
 				wins, err := a.desktop.Windows()
@@ -803,25 +787,6 @@ func desktopTools() []Tool {
 					return a.resp(c, map[string]any{"error": err.Error()})
 				}
 				return a.resp(c, map[string]any{"windows": wins, "count": len(wins)})
-			}),
-		tool("desktop_focus", "Raise and focus a window by its numeric id or a title substring. Returns a screenshot.",
-			map[string]any{
-				"type": "OBJECT",
-				"properties": map[string]any{
-					"target": map[string]any{"type": "STRING", "description": "Window id or title substring"},
-				},
-				"required": []any{"target"},
-			},
-			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
-				target := strVal(c.Args["target"])
-				if target == "" {
-					return a.resp(c, map[string]any{"error": "desktop_focus requires a target (window id or title substring)"})
-				}
-				if err := a.desktop.Focus(target); err != nil {
-					return a.resp(c, map[string]any{"error": err.Error()})
-				}
-				id, title, _ := a.desktop.ActiveWindow()
-				return a.deskShotResp(c, map[string]any{"ok": true, "focused_id": id, "focused_title": title})
 			}),
 		tool("desktop_screenshot", "Capture a screenshot of the whole screen, or of a specific window if 'window' (id or title) is given.",
 			map[string]any{
@@ -842,88 +807,6 @@ func desktopTools() []Tool {
 					return a.resp(c, map[string]any{"error": err.Error()})
 				}
 				return a.imageResp(c, img, map[string]any{"ok": true})
-			}),
-		tool("desktop_move", "Move the mouse pointer to absolute screen coordinates (x, y in pixels).",
-			map[string]any{
-				"type": "OBJECT",
-				"properties": map[string]any{
-					"x": map[string]any{"type": "NUMBER", "description": "X coordinate"},
-					"y": map[string]any{"type": "NUMBER", "description": "Y coordinate"},
-				},
-				"required": []any{"x", "y"},
-			},
-			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
-				x, y := intVal(c.Args["x"], 0), intVal(c.Args["y"], 0)
-				if err := a.desktop.MouseMove(x, y); err != nil {
-					return a.resp(c, map[string]any{"error": err.Error()})
-				}
-				return a.resp(c, map[string]any{"ok": true, "moved_to": []int{x, y}})
-			}),
-		tool("desktop_click", "Move the mouse to (x, y) and click. Button is \"left\", \"middle\" or \"right\". Returns a screenshot after the click.",
-			map[string]any{
-				"type": "OBJECT",
-				"properties": map[string]any{
-					"x":      map[string]any{"type": "NUMBER", "description": "X coordinate"},
-					"y":      map[string]any{"type": "NUMBER", "description": "Y coordinate"},
-					"button": map[string]any{"type": "STRING", "description": "left | middle | right (default left)"},
-				},
-				"required": []any{"x", "y"},
-			},
-			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
-				x, y := intVal(c.Args["x"], 0), intVal(c.Args["y"], 0)
-				if err := a.desktop.Click(x, y, strVal(c.Args["button"])); err != nil {
-					return a.resp(c, map[string]any{"error": err.Error()})
-				}
-				return a.deskShotResp(c, map[string]any{"ok": true, "clicked": []int{x, y}})
-			}),
-		tool("desktop_type", "Type text into the currently focused window. Returns a screenshot after typing.",
-			map[string]any{
-				"type": "OBJECT",
-				"properties": map[string]any{
-					"text": map[string]any{"type": "STRING", "description": "Text to type"},
-				},
-				"required": []any{"text"},
-			},
-			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
-				text := strVal(c.Args["text"])
-				if err := a.desktop.Type(text); err != nil {
-					return a.resp(c, map[string]any{"error": err.Error()})
-				}
-				return a.deskShotResp(c, map[string]any{"ok": true, "typed": text})
-			}),
-		tool("desktop_key", "Press a key or key combination in the focused window, e.g. \"Return\", \"Escape\", \"ctrl+c\", \"alt+Tab\". Returns a screenshot.",
-			map[string]any{
-				"type": "OBJECT",
-				"properties": map[string]any{
-					"key": map[string]any{"type": "STRING", "description": "Key or combination"},
-				},
-				"required": []any{"key"},
-			},
-			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
-				key := strVal(c.Args["key"])
-				if key == "" {
-					return a.resp(c, map[string]any{"error": "desktop_key requires a key"})
-				}
-				if err := a.desktop.Key(key); err != nil {
-					return a.resp(c, map[string]any{"error": err.Error()})
-				}
-				return a.deskShotResp(c, map[string]any{"ok": true, "pressed": key})
-			}),
-		tool("desktop_scroll", "Scroll the mouse wheel up or down at the current pointer position. Returns a screenshot.",
-			map[string]any{
-				"type": "OBJECT",
-				"properties": map[string]any{
-					"direction": map[string]any{"type": "STRING", "description": "\"up\" or \"down\""},
-					"amount":    map[string]any{"type": "NUMBER", "description": "Number of wheel clicks (default 1)"},
-				},
-				"required": []any{"direction"},
-			},
-			func(a *Agent, _ context.Context, c llm.FunctionCall) llm.FunctionResponse {
-				amount := intVal(c.Args["amount"], 1)
-				if err := a.desktop.Scroll(strVal(c.Args["direction"]), amount); err != nil {
-					return a.resp(c, map[string]any{"error": err.Error()})
-				}
-				return a.deskShotResp(c, map[string]any{"ok": true, "scrolled": amount})
 			}),
 	}
 }

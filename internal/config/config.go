@@ -24,6 +24,7 @@ type Config struct {
 	CommandTimeout    time.Duration
 	ShutdownTimeout   time.Duration
 	MaxConcurrentRuns int
+	PolishMaxRounds   int
 	LogRetentionDays  int
 	Prices            pricing.Table
 }
@@ -47,6 +48,7 @@ func Load() (*Config, error) {
 		CommandTimeout:    durationFromEnv("COMMAND_TIMEOUT", 30*time.Second),
 		ShutdownTimeout:   durationFromEnv("SHUTDOWN_TIMEOUT", 30*time.Second),
 		MaxConcurrentRuns: intFromEnv("MAX_CONCURRENT_RUNS", 1),
+		PolishMaxRounds:   intFromEnv("POLISH_MAX_ROUNDS", 5),
 		LogRetentionDays:  intFromEnv("LOG_RETENTION_DAYS", 30),
 		Prices:            pricing.DefaultTable(),
 	}

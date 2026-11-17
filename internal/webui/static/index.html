@@ -34,6 +34,12 @@
           <label>Name<input id="f-name" placeholder="Gemini A" /></label>
           <label>Slug<input id="f-slug" placeholder="gemini-a" /></label>
           <label>Base URL<input id="f-baseurl" value="https://generativelanguage.googleapis.com/v1beta" /></label>
+          <label>Provider
+            <select id="f-provider">
+              <option value="gemini">Gemini</option>
+              <option value="openai">DeepSeek (OpenAI)</option>
+            </select>
+          </label>
           <label>Model (empty = auto)<input id="f-model" placeholder="auto" /></label>
           <label>API key<input id="f-key" type="password" autocomplete="off" /></label>
           <label>Proxy host<input id="f-phost" placeholder="127.0.0.1" /></label>
@@ -72,6 +78,7 @@
               <div class="mode-toggle">
                 <button id="btn-mode-single" class="btn small active">Single</button>
                 <button id="btn-mode-swarm" class="btn small">Swarm</button>
+                <button id="btn-mode-polish" class="btn small">Polish</button>
               </div>
               <button id="btn-run" class="btn">Send</button>
               <button id="btn-stop" class="btn ghost hidden">Stop</button>

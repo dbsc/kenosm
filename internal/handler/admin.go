@@ -38,6 +38,7 @@ type serviceInput struct {
 	UpstreamAPIKey *string `json:"upstream_api_key"`
 	AuthHeader     *string `json:"auth_header"`
 	AuthScheme     *string `json:"auth_scheme"`
+	Provider       *string `json:"provider"`
 	ProxyHost      *string `json:"proxy_host"`
 	ProxyPort      *int    `json:"proxy_port"`
 	ProxyUsername  *string `json:"proxy_username"`
@@ -60,6 +61,7 @@ func (a *Admin) Create(w http.ResponseWriter, r *http.Request) {
 		UpstreamAPIKey: deref(in.UpstreamAPIKey),
 		AuthHeader:     defaultString(in.AuthHeader, "Authorization"),
 		AuthScheme:     defaultString(in.AuthScheme, "Bearer"),
+		Provider:       defaultString(in.Provider, "gemini"),
 		ProxyHost:      deref(in.ProxyHost),
 		ProxyPort:      derefInt(in.ProxyPort),
 		ProxyUsername:  deref(in.ProxyUsername),
@@ -145,6 +147,9 @@ func (a *Admin) Update(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.AuthScheme != nil {
 		svc.AuthScheme = *in.AuthScheme
+	}
+	if in.Provider != nil {
+		svc.Provider = *in.Provider
 	}
 	if in.ProxyHost != nil {
 		svc.ProxyHost = *in.ProxyHost

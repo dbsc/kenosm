@@ -20,6 +20,7 @@ func AgentsFromServices(services []model.Service) []Agent {
 			Slug:        svc.Slug,
 			BaseURL:     svc.UpstreamURL,
 			APIKey:      svc.UpstreamAPIKey,
+			Provider:    svc.Provider,
 			Proxy:       transport.ProxySpec{Host: svc.ProxyHost, Port: svc.ProxyPort, Username: svc.ProxyUsername, Password: svc.ProxyPassword},
 			ManualModel: svc.Model,
 		})

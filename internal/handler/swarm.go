@@ -46,11 +46,15 @@ type Swarm struct {
 	mu                sync.Mutex      // guards disabledModules
 	disabledModules   map[string]bool // tool modules disabled at runtime
 	sem               chan struct{}   // bounds concurrent runs (spawning browsers + model calls)
+	polishMaxRounds   int             // max self-review rounds in polish mode
 }
 
-func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo, tc *transport.Cache, disabledModules []string, maxConcurrent int) *Swarm {
+func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo, tc *transport.Cache, disabledModules []string, maxConcurrent, polishMaxRounds int) *Swarm {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 1
+	}
+	if polishMaxRounds <= 0 {
+		polishMaxRounds = 3
 	}
 	return &Swarm{
 		repo:              repo,
@@ -68,6 +72,7 @@ func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *
 		transportCache:    tc,
 		disabledModules:   moduleSet(disabledModules),
 		sem:               make(chan struct{}, maxConcurrent),
+		polishMaxRounds:   polishMaxRounds,
 	}
 }
 
@@ -137,7 +142,7 @@ func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mode := in.Mode
-	if mode != modeSingle && mode != modeSwarm {
+	if mode != modeSingle && mode != modeSwarm && mode != modePolish {
 		mode = modeSwarm
 	}
 	runID, _ := h.runTurn(agents, in.Task, images, nil, mode, nil, nil, nil)
@@ -196,6 +201,7 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 		Desktop:           h.desktop,
 		Emitter:           emitter,
 		TransportCache:    h.transportCache,
+		PolishMaxRounds:   h.polishMaxRounds,
 	})
 
 	// A fresh context lets the run outlive the HTTP request; its cancel is wired
@@ -215,6 +221,8 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 		case modeSingle:
 			history := append(append([]llm.Turn{}, prior...), llm.Turn{Role: "user", Text: task, Images: images})
 			result, err = sw.RunSingle(runCtx, agents[0], history)
+		case modePolish:
+			result, err = sw.RunPolish(runCtx, task, images, prior)
 		default:
 			result, err = sw.Run(runCtx, task, images, prior)
 		}

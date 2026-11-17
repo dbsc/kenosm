@@ -20,6 +20,7 @@ import (
 const (
 	modeSingle = "single"
 	modeSwarm  = "swarm"
+	modePolish = "polish"
 )
 
 // dbTimeout bounds chat-store writes so a slow DB cannot stall a request or a
@@ -97,7 +98,7 @@ func (h *Swarm) SendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mode := in.Mode
-	if mode != modeSingle && mode != modeSwarm {
+	if mode != modeSingle && mode != modeSwarm && mode != modePolish {
 		mode = modeSingle
 	}
 	images, err := parseImages(in.Images)

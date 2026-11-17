@@ -52,12 +52,13 @@ func TestToolModulesCompose(t *testing.T) {
 	}
 
 	// Browser and desktop modules enable only when their runtime is present.
+	// Desktop is screenshot-only now: files(5) + shell(1) + browser(7) + desktop(2) = 15.
 	a = New(Config{Browser: &browser.Browser{}, Desktop: &desktop.Desktop{}})
 	names = toolNames(a)
-	if len(names) != 22 {
-		t.Fatalf("all modules = %d tools, want 22", len(names))
+	if len(names) != 15 {
+		t.Fatalf("all modules = %d tools, want 15", len(names))
 	}
-	for _, want := range []string{"write_file", "run_command", "browser_navigate", "desktop_click"} {
+	for _, want := range []string{"write_file", "run_command", "browser_navigate", "desktop_screenshot"} {
 		if !has(names, want) {
 			t.Errorf("expected tool %q in the full toolset", want)
 		}
@@ -71,13 +72,13 @@ func TestDisabledToolsFilter(t *testing.T) {
 		DisabledTools: []string{"run_command", "browser_click"},
 	})
 	names := toolNames(a)
-	if len(names) != 20 {
-		t.Fatalf("after disabling 2 tools = %d, want 20", len(names))
+	if len(names) != 13 {
+		t.Fatalf("after disabling 2 tools = %d, want 13", len(names))
 	}
 	if has(names, "run_command") || has(names, "browser_click") {
 		t.Fatalf("disabled tool still present: %v", names)
 	}
-	if !has(names, "write_file") || !has(names, "desktop_type") {
+	if !has(names, "write_file") || !has(names, "desktop_screenshot") {
 		t.Fatalf("non-disabled tools missing: %v", names)
 	}
 }
