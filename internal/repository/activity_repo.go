@@ -142,6 +142,16 @@ func (r *ActivityRepo) Timeline(ctx context.Context, runID string) ([]TimelineBa
 	return bars, nil
 }
 
+// Prune deletes activity rows older than the cutoff and returns how many were
+// removed, keeping the activity table bounded.
+func (r *ActivityRepo) Prune(ctx context.Context, olderThan time.Time) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM activity WHERE created_at < $1`, olderThan)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 func collectActivity(rows interface {
 	Next() bool
 	Scan(...any) error

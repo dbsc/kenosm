@@ -16,15 +16,18 @@ import (
 type runState struct {
 	mu         sync.Mutex
 	events     []swarm.Event
+	frames     map[string]swarm.Event // latest browser_frame per agent (bounded)
+	frameOrder []string               // first-seen agent order for frames
 	subs       map[chan swarm.Event]struct{}
 	done       bool
 	stopped    bool
+	exited     bool // the run's worker goroutine has returned
 	cancel     context.CancelFunc
 	finishedAt time.Time // when the run reached a terminal state (used for reaping)
 }
 
 func newRunState() *runState {
-	return &runState{subs: make(map[chan swarm.Event]struct{})}
+	return &runState{subs: make(map[chan swarm.Event]struct{}), frames: make(map[string]swarm.Event)}
 }
 
 func (rs *runState) setCancel(c context.CancelFunc) {
@@ -56,9 +59,28 @@ func (rs *runState) isStopped() bool {
 	return rs.stopped
 }
 
+// markExited records that the run's worker goroutine has returned. The event
+// log may stay for late SSE subscribers; this flag is what tells callers the
+// run is no longer doing anything.
+func (rs *runState) markExited() {
+	rs.mu.Lock()
+	rs.exited = true
+	rs.mu.Unlock()
+}
+
 func (rs *runState) add(e swarm.Event) {
 	rs.mu.Lock()
-	rs.events = append(rs.events, e)
+	// Browser frames are high-volume (a full base64 PNG every tick, per agent).
+	// Keep only the latest frame per agent instead of growing rs.events with
+	// every frame; the frames are still broadcast live to subscribers below.
+	if e.Type == "browser_frame" {
+		if _, seen := rs.frames[e.Agent]; !seen {
+			rs.frameOrder = append(rs.frameOrder, e.Agent)
+		}
+		rs.frames[e.Agent] = e
+	} else {
+		rs.events = append(rs.events, e)
+	}
 	if e.Type == "done" || e.Type == "error" || e.Type == "stopped" {
 		rs.done = true
 		rs.finishedAt = time.Now()
@@ -106,13 +128,39 @@ func (rs *runState) unsubscribe(ch chan swarm.Event) {
 	rs.mu.Unlock()
 }
 
+// browserFrames returns the latest browser_frame event per agent, in first-seen
+// order — the initial state for the frontend's live browser grid.
+func (rs *runState) browserFrames() []swarm.Event {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	out := make([]swarm.Event, 0, len(rs.frameOrder))
+	for _, a := range rs.frameOrder {
+		out = append(out, rs.frames[a])
+	}
+	return out
+}
+
 type runRegistry struct {
 	mu   sync.Mutex
 	runs map[string]*runState
 }
 
 func newRunRegistry() *runRegistry {
-	return &runRegistry{runs: make(map[string]*runState)}
+	rr := &runRegistry{runs: make(map[string]*runState)}
+	go rr.reapLoop()
+	return rr
+}
+
+// reapLoop periodically reaps long-finished runs so their event logs don't sit
+// in memory forever when no new run is created (create() also reaps on demand).
+// The registry lives for the whole server process, so this is a process-lifetime
+// daemon goroutine.
+func (rr *runRegistry) reapLoop() {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for range t.C {
+		rr.reapFinished(runReapMaxAge)
+	}
 }
 
 func (rr *runRegistry) create() (string, *runState) {
@@ -154,6 +202,44 @@ func (rr *runRegistry) get(id string) *runState {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
 	return rr.runs[id]
+}
+
+// latestWithFrames returns the most recently started run that has any
+// browser_frame events — the frontend's browser pane uses this when the page
+// was reloaded mid-run and the SSE history is gone.
+func (rr *runRegistry) latestWithFrames() *runState {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	var best *runState
+	var bestAt time.Time
+	for _, rs := range rr.runs {
+		rs.mu.Lock()
+		has := len(rs.frameOrder) > 0
+		var t time.Time
+		if len(rs.events) > 0 {
+			t = rs.events[0].Time // the run's "start" event
+		}
+		rs.mu.Unlock()
+		if has && (best == nil || t.After(bestAt)) {
+			best, bestAt = rs, t
+		}
+	}
+	return best
+}
+
+// active counts runs whose worker goroutine has not returned yet.
+func (rr *runRegistry) active() int {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	n := 0
+	for _, rs := range rr.runs {
+		rs.mu.Lock()
+		if !rs.exited {
+			n++
+		}
+		rs.mu.Unlock()
+	}
+	return n
 }
 
 func randomID() string {

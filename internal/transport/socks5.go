@@ -66,6 +66,19 @@ func New(p ProxySpec) (*http.Transport, error) {
 }
 
 func build(p ProxySpec) (*http.Transport, error) {
+	if p.Host == "" {
+		// No proxy configured: connect directly. Same pooling parameters as the
+		// proxied transport so behaviour is identical except for routing.
+		return &http.Transport{
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}, nil
+	}
+
 	var auth *proxy.Auth
 	if p.Username != "" || p.Password != "" {
 		auth = &proxy.Auth{User: p.Username, Password: p.Password}

@@ -23,6 +23,9 @@ type Event struct {
 	Wave      int       `json:"wave,omitempty"`      // re-decomposition round the subtask ran in (0 = original plan)
 	Result    *Result   `json:"result,omitempty"`
 	Error     string    `json:"error,omitempty"`
+	URL       string    `json:"url,omitempty"`   // page URL, for browser_frame events
+	Title     string    `json:"title,omitempty"` // page title, for browser_frame events
+	Image     string    `json:"image,omitempty"` // base64 PNG of the agent's browser viewport, for browser_frame events
 }
 
 // Emitter receives progress events. It may be nil (events are then dropped).

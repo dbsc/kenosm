@@ -96,6 +96,11 @@ func (g *Gateway) director(req *http.Request) {
 	}
 	remaining, _ := req.Context().Value(remainingPathKey).(string)
 
+	// The client's own credentials must never travel to the upstream: they
+	// authenticate the caller against kenosm, not against the target API.
+	req.Header.Del("Authorization")
+	req.Header.Del("X-Api-Key")
+
 	req.URL.Scheme = target.Scheme
 	req.URL.Host = target.Host
 	req.URL.Path = joinURLPath(target.Path, remaining)
@@ -136,6 +141,13 @@ func (g *Gateway) RoundTrip(req *http.Request) (*http.Response, error) {
 func (g *Gateway) handleProxyError(w http.ResponseWriter, r *http.Request, err error) {
 	if rec, ok := w.(*statusRecorder); ok {
 		rec.err = err
+		if rec.headerSent {
+			// The response already started: writing a 502 mid-body would corrupt
+			// the stream. Abort the connection instead so the client sees a
+			// clean truncation. chi's Recoverer re-panics ErrAbortHandler, and
+			// net/http closes the connection without logging a stack trace.
+			panic(http.ErrAbortHandler)
+		}
 	}
 	writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 }
@@ -179,14 +191,16 @@ func joinURLPath(a, b string) string {
 // transparently passing through streaming, hijacking and efficient copies.
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
-	err    error
+	status     int
+	headerSent bool
+	err        error
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
 	if r.status == 0 {
 		r.status = code
 	}
+	r.headerSent = true
 	r.ResponseWriter.WriteHeader(code)
 }
 
@@ -194,6 +208,7 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	if r.status == 0 {
 		r.status = http.StatusOK
 	}
+	r.headerSent = true
 	return r.ResponseWriter.Write(b)
 }
 

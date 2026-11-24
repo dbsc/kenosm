@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -28,7 +29,9 @@ type Config struct {
 	DisabledTools []string
 	Log           func(kind, tool, detail string) // optional progress callback; tool is the tool name for tool events
 	OnUsage       func(llm.Usage)                 // optional: fired after each model call with its token usage
+	OnSession     func(s *browser.Session)        // optional: fired when the agent opens its browser session (live-view hook)
 	SystemExtra   string                          // optional: appended to the agent's system prompt (e.g. a shared contract)
+	ContextBytes  int                             // optional: context-window budget for history compaction (0 = 48 KiB)
 }
 
 // Result is what an agent did during a run.
@@ -113,7 +116,9 @@ type Agent struct {
 	tools       []Tool
 	log         func(kind, tool, detail string)
 	onUsage     func(llm.Usage)
+	onSession   func(*browser.Session)
 	systemExtra string
+	ctxBytes    int    // context-window budget for history compaction (0 = default)
 	files       []string // paths written/edited during the run
 }
 
@@ -149,7 +154,7 @@ func New(cfg Config) *Agent {
 	addModule(cfg.Browser != nil, browserTools())
 	addModule(cfg.Desktop != nil, desktopTools())
 
-	return &Agent{llm: cfg.LLM, ws: cfg.Workspace, browser: cfg.Browser, desktop: cfg.Desktop, proxy: cfg.Proxy, maxIt: maxIt, tools: tools, log: cfg.Log, onUsage: cfg.OnUsage, systemExtra: cfg.SystemExtra}
+	return &Agent{llm: cfg.LLM, ws: cfg.Workspace, browser: cfg.Browser, desktop: cfg.Desktop, proxy: cfg.Proxy, maxIt: maxIt, tools: tools, log: cfg.Log, onUsage: cfg.OnUsage, onSession: cfg.OnSession, systemExtra: cfg.SystemExtra, ctxBytes: cfg.ContextBytes}
 }
 
 func (a *Agent) Run(ctx context.Context, task string, images []llm.Image) (Result, error) {
@@ -184,6 +189,13 @@ func (a *Agent) RunWithHistory(ctx context.Context, history []llm.Turn) (Result,
 
 	for iterations < a.maxIt {
 		iterations++
+		// Long tool loops grow the conversation until the provider's context
+		// window rejects the request (DeepSeek: 64K). Compact the history
+		// before each call: keep the original task turn and the most recent
+		// exchanges, dropping whole (model, tool-responses) pairs so the
+		// role alternation stays valid. The budget comes from the run's
+		// context-window setting (a.ctxBytes), defaulting to 48 KiB.
+		history = a.compactHistory(history)
 		if a.log != nil {
 			a.log("model", "", "generating response")
 		}
@@ -292,7 +304,8 @@ You can observe the desktop via screenshots: use desktop_windows to list visible
 All file paths are relative to the workspace root. Never prefix a path with "workspace/" or an absolute directory — write "app/index.html", not "workspace/app/index.html".`)
 	}
 	b.WriteString(`
-When finished, output a concise summary of what you did and the result.`)
+When finished, output a concise summary of what you did and the result.
+If your task involved a plan, architecture, data flow or process, add a mermaid diagram in a fenced code block with the language tag "mermaid" (flowchart or sequenceDiagram) to your summary — the user's UI renders it directly.`)
 
 	if a.systemExtra != "" {
 		b.WriteString("\n\n" + a.systemExtra)
@@ -330,6 +343,76 @@ func dedupe(s []string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+// compactHistory drops whole (model, tool-response) exchange pairs from the
+// middle of the conversation so a long tool loop stays inside the provider's
+// context window. The first turn (the task) and the most recent exchanges are
+// kept; the role alternation (user → model → user → …) is preserved.
+const (
+	historyMaxTurns        = 24
+	defaultHistoryMaxBytes = 48 * 1024
+)
+
+// compactHistory is the agent's history budget applied per-run: the context
+// window selected in the UI (a.ctxBytes) replaces the default 48 KiB.
+func (a *Agent) compactHistory(history []llm.Turn) []llm.Turn {
+	budget := a.ctxBytes
+	if budget <= 0 {
+		budget = defaultHistoryMaxBytes
+	}
+	return compactHistoryBudget(history, budget)
+}
+
+// compactHistoryBudget drops whole exchange pairs from the middle of the
+// conversation so a long tool loop stays inside the provider's context window.
+// It prefers genuine tool-exchange pairs (a model turn carrying tool calls
+// followed by its matching user tool-response turn): those are self-contained
+// once executed and carry the largest payloads (screenshots come back as base64
+// tool responses). When no tool pair exists (a plain text chat), the oldest
+// conversational exchange after the task turn is dropped instead. The first turn
+// (the task) and the most recent exchanges are always kept; the role alternation
+// (user → model → user → …) is preserved. The budget bounds the serialized size.
+func compactHistoryBudget(history []llm.Turn, budget int) []llm.Turn {
+	for len(history) > historyMaxTurns || historyBytes(history) > budget {
+		if len(history) < 3 {
+			return history // nothing safe left to drop
+		}
+		// Drop the oldest tool-exchange pair when one exists.
+		if idx := firstToolPairIndex(history); idx >= 1 {
+			history = append(append([]llm.Turn{}, history[:idx]...), history[idx+2:]...)
+			continue
+		}
+		// No tool pair: drop the oldest exchange after the task (index 1 and 2).
+		if history[1].Role != "model" {
+			return history // unexpected shape: refuse to mangle it
+		}
+		history = append([]llm.Turn{history[0]}, history[3:]...)
+	}
+	return history
+}
+
+// firstToolPairIndex returns the index of the first model turn that carries tool
+// calls and is immediately followed by its matching user tool-response turn, or
+// -1 when the history contains no such pair.
+func firstToolPairIndex(history []llm.Turn) int {
+	for i := 1; i+1 < len(history); i++ {
+		if history[i].Role == "model" && len(history[i].ToolCalls) > 0 &&
+			history[i+1].Role == "user" && len(history[i+1].ToolResponses) > 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+// historyBytes estimates the serialized size of the conversation, used to
+// bound total context growth (a few turns can carry huge file contents).
+func historyBytes(history []llm.Turn) int {
+	data, err := json.Marshal(history)
+	if err != nil {
+		return 0
+	}
+	return len(data)
 }
 
 // toolSignature produces a stable string for a set of tool calls so the loop
@@ -376,6 +459,9 @@ func (a *Agent) bsession() (*browser.Session, error) {
 		return nil, err
 	}
 	a.session = s
+	if a.onSession != nil {
+		a.onSession(s)
+	}
 	return s, nil
 }
 
@@ -410,14 +496,32 @@ func (a *Agent) imageResp(c llm.FunctionCall, img []byte, meta map[string]any) l
 }
 
 // resolveTarget turns a URL or workspace-relative file path into something the
-// browser can load (http(s)/file URL).
-func (a *Agent) resolveTarget(t string) string {
+// browser can load (http(s)/file URL). Local file targets must stay inside the
+// workspace: the browser must never be able to read arbitrary host files.
+func (a *Agent) resolveTarget(t string) (string, error) {
 	t = strings.TrimSpace(t)
-	if strings.HasPrefix(t, "http://") || strings.HasPrefix(t, "https://") || strings.HasPrefix(t, "file://") {
-		return t
+	if strings.HasPrefix(t, "http://") || strings.HasPrefix(t, "https://") {
+		return t, nil
 	}
-	abs := filepath.Join(a.ws.Root(), filepath.FromSlash(strings.TrimPrefix(t, "./")))
-	return "file://" + filepath.ToSlash(abs)
+	if strings.HasPrefix(t, "file://") {
+		u, err := url.Parse(t)
+		if err != nil {
+			return "", fmt.Errorf("invalid file URL: %w", err)
+		}
+		if u.Host != "" && u.Host != "localhost" {
+			return "", fmt.Errorf("file URLs must reference the local workspace")
+		}
+		abs, err := a.ws.Resolve(u.Path)
+		if err != nil {
+			return "", err
+		}
+		return "file://" + filepath.ToSlash(abs), nil
+	}
+	abs, err := a.ws.Resolve(strings.TrimPrefix(t, "./"))
+	if err != nil {
+		return "", err
+	}
+	return "file://" + filepath.ToSlash(abs), nil
 }
 
 // noteFile records a workspace-relative path that this agent wrote or edited.
@@ -487,7 +591,9 @@ func describeTool(c llm.FunctionCall) string {
 		}
 	case "run_command":
 		if cmd, ok := c.Args["command"].(string); ok {
-			return "run_command " + cmd
+			// Truncate: full commands may contain secrets and would land in the
+			// activity log and the frontend feed verbatim.
+			return "run_command " + truncate(cmd, 120)
 		}
 	case "edit_file":
 		if p, ok := c.Args["path"].(string); ok {
@@ -505,25 +611,16 @@ func describeTool(c llm.FunctionCall) string {
 		return "browser_type " + strVal(c.Args["target"])
 	case "browser_scroll":
 		return "browser_scroll " + strVal(c.Args["direction"])
-	case "desktop_launch":
-		return "desktop_launch " + strVal(c.Args["program"])
-	case "desktop_click":
-		return "desktop_click " + strVal(c.Args["x"]) + "," + strVal(c.Args["y"])
-	case "desktop_type":
-		return "desktop_type " + truncate(strVal(c.Args["text"]), 40)
-	case "desktop_key":
-		return "desktop_key " + strVal(c.Args["key"])
-	case "desktop_focus":
-		return "desktop_focus " + strVal(c.Args["target"])
 	}
 	return c.Name
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(r[:n]) + "..."
 }
 
 // fileTools returns the workspace file tools (always available).
@@ -665,7 +762,11 @@ func browserTools() []Tool {
 				if err != nil {
 					return a.resp(c, map[string]any{"error": err.Error()})
 				}
-				if err := s.Navigate(a.resolveTarget(target)); err != nil {
+				targetURL, err := a.resolveTarget(target)
+				if err != nil {
+					return a.resp(c, map[string]any{"error": err.Error()})
+				}
+				if err := s.Navigate(targetURL); err != nil {
 					return a.resp(c, map[string]any{"error": err.Error()})
 				}
 				return a.shotResp(c, s, map[string]any{"ok": true, "url": target})

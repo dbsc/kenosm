@@ -14,7 +14,7 @@ import (
 // New builds the HTTP router wiring admin CRUD, the proxy gateway, the swarm
 // orchestrator, the workspace API and the frontend together. When apiKey is
 // non-empty, every /api/v1/* route and the /proxy/* gateway require it.
-func New(admin *handler.Admin, gateway *handler.Gateway, swarm *handler.Swarm, ws *handler.Workspace, stats *handler.Stats, activity *handler.Activity, static http.Handler, apiKey string) http.Handler {
+func New(admin *handler.Admin, gateway *handler.Gateway, swarm *handler.Swarm, ws *handler.Workspace, stats *handler.Stats, activity *handler.Activity, stt *handler.Transcribe, voice *handler.Voice, static http.Handler, apiKey string) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -47,8 +47,17 @@ func New(admin *handler.Admin, gateway *handler.Gateway, swarm *handler.Swarm, w
 		// Swarm orchestration.
 		r.Post("/api/v1/swarm/run", swarm.Run)
 		r.Get("/api/v1/swarm/run/{runID}/events", swarm.Events)
+		r.Get("/api/v1/swarm/run/{runID}/browsers", swarm.Browsers)
+		r.Get("/api/v1/swarm/latest-browsers", swarm.LatestBrowsers)
 		r.Post("/api/v1/swarm/run/{runID}/stop", swarm.Stop)
 		r.Get("/api/v1/models", swarm.Models)
+
+		// Voice input: start/stop a server-side microphone capture (works in
+		// the native WebKitGTK app, where getUserMedia is denied), and
+		// transcribe a pre-recorded clip via STT_CMD.
+		r.Post("/api/v1/transcribe", stt.Transcribe)
+		r.Post("/api/v1/voice/start", voice.Start)
+		r.Post("/api/v1/voice/stop", voice.Stop)
 
 		// Prompt generator: rewrite a rough idea into a ready-to-run task prompt.
 		r.Post("/api/v1/prompt/generate", swarm.GeneratePrompt)
@@ -67,7 +76,13 @@ func New(admin *handler.Admin, gateway *handler.Gateway, swarm *handler.Swarm, w
 		// Workspace.
 		r.Get("/api/v1/workspace/files", ws.List)
 		r.Get("/api/v1/workspace/files/*", ws.Read)
+		r.Get("/api/v1/workspace/tree", ws.Tree)
+		r.Get("/api/v1/workspace/root", ws.Root)
+		r.Post("/api/v1/workspace/root", ws.SetRoot)
 		r.Post("/api/v1/workspace/clear", ws.Clear)
+		r.Post("/api/v1/workspace/upload", ws.Upload)
+		r.Get("/api/v1/fs/dirs", ws.ListDirs)
+		r.Get("/api/v1/fs/home", ws.Home)
 
 		// Usage statistics.
 		r.Get("/api/v1/stats", stats.Get)

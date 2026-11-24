@@ -99,7 +99,7 @@ func TestDirectionFor(t *testing.T) {
 			t.Errorf("DirectionFor(%q) = %q, want read", tool, got)
 		}
 	}
-	writes := []string{"write_file", "edit_file", "run_command", "desktop_launch", "desktop_focus", "desktop_move", "desktop_click", "desktop_type", "desktop_key", "desktop_scroll"}
+	writes := []string{"write_file", "edit_file", "run_command"}
 	for _, tool := range writes {
 		if got := DirectionFor(tool); got != "write" {
 			t.Errorf("DirectionFor(%q) = %q, want write", tool, got)
@@ -313,6 +313,26 @@ func TestExecStateConcurrentWorkers(t *testing.T) {
 
 	if len(st.results) != jobs {
 		t.Fatalf("results = %d, want %d", len(st.results), jobs)
+	}
+}
+
+func TestParseGoalVerdict(t *testing.T) {
+	raw := "```json\n{\"done\": false, \"gaps\": \"4 screenshots missing\", \"fix_plan\": [\"screenshot altcoin sites\", \"screenshot defi sites\"]}\n```"
+	v, err := parseGoalVerdict(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if v.Done || v.Gaps == "" || len(v.FixPlan) != 2 {
+		t.Fatalf("unexpected verdict: %+v", v)
+	}
+
+	done, err := parseGoalVerdict(`{"done": true, "gaps": "", "fix_plan": []}`)
+	if err != nil || !done.Done || len(done.FixPlan) != 0 {
+		t.Fatalf("done verdict parse failed: %+v err=%v", done, err)
+	}
+
+	if _, err := parseGoalVerdict("no json here"); err == nil {
+		t.Fatal("garbage must fail to parse")
 	}
 }
 

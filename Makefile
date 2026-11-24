@@ -1,10 +1,16 @@
-.PHONY: build run db-up db-down tidy test vet
+.PHONY: build run db-up db-down tidy test vet install
 
 build:
-	go build -o bin/kenosm ./cmd/server
+	CGO_ENABLED=1 go build -o bin/kenosm ./cmd/kenosm
+	go build -o bin/kenosm-server ./cmd/server
 
 run:
-	go run ./cmd/server
+	go run ./cmd/kenosm
+
+install: build
+	mkdir -p $(HOME)/.local/bin
+	cp bin/kenosm $(HOME)/.local/bin/kenosm
+	@echo "installed to $(HOME)/.local/bin/kenosm (make sure it is on your PATH)"
 
 db-up:
 	docker compose up -d db

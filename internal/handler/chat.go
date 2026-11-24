@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -87,9 +86,13 @@ func (h *Swarm) SendMessage(w http.ResponseWriter, r *http.Request) {
 			MimeType string `json:"mime_type"`
 			Data     string `json:"data"`
 		} `json:"images"`
+		ContextKB int    `json:"context_kb"` // context-window budget in KiB (0 = default)
+		Reasoning string `json:"reasoning"`  // fast | normal | deep
+		Refine    bool   `json:"refine"`     // rewrite the raw idea into a full task prompt first
+		Agent     string `json:"agent"`      // service slug to run in single mode ("" = default/orchestrator picks)
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if err := decodeJSON(w, r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	text := strings.TrimSpace(in.Text)
@@ -123,6 +126,19 @@ func (h *Swarm) SendMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
+	if in.Agent != "" {
+		var ok bool
+		agents, ok = selectAgent(agents, in.Agent)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "unknown agent: "+in.Agent)
+			return
+		}
+		mode = modeSingle // a specific agent is always a single-agent turn
+	}
+	if h.runsDisabled() {
+		writeError(w, http.StatusServiceUnavailable, "runs are disabled (MAX_CONCURRENT_RUNS=0)")
+		return
+	}
 	if !h.tryAcquireRun() {
 		writeError(w, http.StatusTooManyRequests, "too many concurrent runs")
 		return
@@ -144,7 +160,25 @@ func (h *Swarm) SendMessage(w http.ResponseWriter, r *http.Request) {
 	// Prior turns are everything before the message we just appended.
 	prior := chatHistoryToTurns(chat.Messages)
 
-	runID, _ := h.runTurn(agents, text, images, prior, mode, func(res *swarm.Result) {
+	// Prompt refinement: rewrite the raw idea into a detailed, self-contained
+	// task before the swarm sees it (one orchestrator call, no workers).
+	task := text
+	refined := ""
+	if in.Refine {
+		refCtx, refCancel := context.WithTimeout(r.Context(), 3*time.Minute)
+		p, perr := h.newSwarm(agents, nil, runOptions{}).GeneratePrompt(refCtx, text)
+		refCancel()
+		if perr != nil {
+			h.releaseRun()
+			writeError(w, http.StatusBadGateway, "prompt refinement failed: "+perr.Error())
+			return
+		}
+		refined = p
+		task = p
+	}
+
+	opts := runOptions{ContextBytes: in.ContextKB * 1024, ReasoningLevel: in.Reasoning}
+	runID, state := h.runTurn(agents, task, images, prior, mode, opts, func(res *swarm.Result) {
 		ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 		defer cancel()
 		_, _ = h.chats.AppendMessage(ctx, chatID, "assistant", res.Final, mode)
@@ -155,18 +189,35 @@ func (h *Swarm) SendMessage(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		_, _ = h.chats.AppendMessage(ctx, chatID, "assistant", "Error: "+errMsg, mode)
 	}, func() {
-		// A stopped turn leaves no reply; record a placeholder so the next
-		// message still alternates user/assistant.
+		// A stopped turn keeps its context: the placeholder tells the next
+		// message what happened, and the prior history (including this turn's
+		// task) still feeds the next run — so edits continue where they left off.
 		ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 		defer cancel()
-		_, _ = h.chats.AppendMessage(ctx, chatID, "assistant", "Stopped.", mode)
+		_, _ = h.chats.AppendMessage(ctx, chatID, "assistant", "Stopped. — Context is preserved: send the next message and the run continues from where it left off.", mode)
 	})
+
+	if refined != "" {
+		state.add(swarm.Event{Time: time.Now(), Type: "prompt_refined", Detail: refined})
+	}
 
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"run_id":     runID,
 		"chat_id":    chatID,
 		"message_id": userMsg.ID,
 	})
+}
+
+// selectAgent returns the agents list narrowed to the single agent whose slug
+// matches, so a chat can run a single-agent turn against a specific model. The
+// second result reports whether a match was found.
+func selectAgent(agents []swarm.Agent, slug string) ([]swarm.Agent, bool) {
+	for _, a := range agents {
+		if a.Slug == slug {
+			return []swarm.Agent{a}, true
+		}
+	}
+	return nil, false
 }
 
 // chatHistoryToTurns converts stored chat messages into LLM turns, mapping the

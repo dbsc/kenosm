@@ -14,3 +14,6 @@ config/agents.json
 # Python build cache
 __pycache__/
 *.pyc
+
+# Speech-to-text virtualenv (large, not committed)
+stt/venv/

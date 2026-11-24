@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -29,6 +30,7 @@ type UsageEntry struct {
 	Cost             float64
 }
 
+// Insert persists one usage entry.
 func (r *UsageRepo) Insert(ctx context.Context, u UsageEntry) error {
 	_, err := r.pool.Exec(ctx,
 		`INSERT INTO usage (run_id, task, agent, model, prompt_tokens, completion_tokens, thought_tokens, total_tokens, cost)
@@ -137,4 +139,14 @@ func (r *UsageRepo) groupBy(ctx context.Context, column string) ([]GroupRow, err
 		out = append(out, g)
 	}
 	return out, rows.Err()
+}
+
+// Prune deletes usage rows older than the cutoff and returns how many were
+// removed, keeping the high-volume usage table bounded.
+func (r *UsageRepo) Prune(ctx context.Context, olderThan time.Time) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM usage WHERE created_at < $1`, olderThan)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }

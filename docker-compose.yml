@@ -2,15 +2,16 @@ services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: kenosm
-      POSTGRES_PASSWORD: kenosm
-      POSTGRES_DB: kenosm
+      POSTGRES_USER: ${POSTGRES_USER:-kenosm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kenosm}
+      POSTGRES_DB: ${POSTGRES_DB:-kenosm}
     ports:
-      - "5432:5432"
+      # Loopback only: the database must not be reachable from the network.
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U kenosm"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kenosm}"]
       interval: 5s
       timeout: 5s
       retries: 10

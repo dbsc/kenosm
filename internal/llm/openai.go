@@ -315,9 +315,39 @@ func toOpenAITools(tools []Tool) []openaiTool {
 	}
 	out := make([]openaiTool, 0, len(tools))
 	for _, t := range tools {
-		out = append(out, openaiTool{Type: "function", Function: openaiFunction{Name: t.Name, Description: t.Description, Parameters: t.Parameters}})
+		params, _ := openaiSchema(t.Parameters).(map[string]any)
+		out = append(out, openaiTool{Type: "function", Function: openaiFunction{Name: t.Name, Description: t.Description, Parameters: params}})
 	}
 	return out
+}
+
+// openaiSchema converts a Gemini-style tool parameter schema (uppercase type
+// names: OBJECT/STRING/NUMBER/ARRAY/BOOLEAN) into the JSON-Schema form the
+// OpenAI Chat Completions API accepts (lowercase type names, recursively).
+// DeepSeek rejects the Gemini spelling with a 400 on the first tool call.
+func openaiSchema(v any) any {
+	switch node := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(node))
+		for k, val := range node {
+			if k == "type" {
+				if s, ok := val.(string); ok {
+					out[k] = strings.ToLower(s)
+					continue
+				}
+			}
+			out[k] = openaiSchema(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(node))
+		for i, val := range node {
+			out[i] = openaiSchema(val)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func parseOpenAI(data []byte, statusCode int) (GenerateResult, error) {

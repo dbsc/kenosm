@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,6 +22,8 @@ type Workspace struct {
 	commandTimeout time.Duration
 	assetsSource   string // optional versioned design library copied into <root>/assets
 	mu             sync.Mutex
+	pgMu           sync.Mutex
+	pgids          map[int]struct{} // process groups started via RunCommand, killed on cleanup
 }
 
 func New(root string, commandTimeout time.Duration) (*Workspace, error) {
@@ -33,10 +34,43 @@ func New(root string, commandTimeout time.Duration) (*Workspace, error) {
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return nil, err
 	}
-	return &Workspace{root: abs, commandTimeout: commandTimeout}, nil
+	return &Workspace{root: abs, commandTimeout: commandTimeout, pgids: map[int]struct{}{}}, nil
 }
 
-func (w *Workspace) Root() string { return w.root }
+func (w *Workspace) Root() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.root
+}
+
+// rootPath returns the current root under the lock — callers that touch the
+// filesystem should capture this once and use the local value.
+func (w *Workspace) rootPath() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.root
+}
+
+// SetRoot switches the workspace to a different directory: the user can pick
+// any project folder, not just the default workspace. The path must exist and
+// be a directory. Files and commands of subsequent runs operate there.
+func (w *Workspace) SetRoot(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("cannot access %s: %w", abs, err)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("%s is not a directory", abs)
+	}
+	w.mu.Lock()
+	w.root = abs
+	w.mu.Unlock()
+	return nil
+}
 
 // SetAssetsSource points the workspace at a versioned design library directory.
 // When set, SeedAssets copies that tree into <root>/assets so agents always have
@@ -107,6 +141,8 @@ func copyFile(src, dst string, mode os.FileMode) error {
 // Clear removes every file and directory inside the workspace, resetting the
 // agents' working context for a fresh run.
 func (w *Workspace) Clear() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	entries, err := os.ReadDir(w.root)
 	if err != nil {
 		return err
@@ -119,35 +155,25 @@ func (w *Workspace) Clear() error {
 	return nil
 }
 
-// CleanupProcesses kills any process whose working directory is the workspace
-// (or inside it) — i.e. servers the agents started in the background and left
-// running. It never touches the kenosm process itself (that runs from the repo
-// root, not the workspace).
+// CleanupProcesses kills the process groups started by RunCommand that are
+// still alive (i.e. servers the agents started in the background and left
+// running). It never touches anything else: unrelated processes that merely
+// happen to have their working directory inside the workspace (a user's
+// terminal or editor) are left alone.
 func (w *Workspace) CleanupProcesses() {
-	rootAbs, err := filepath.Abs(w.root)
-	if err != nil {
-		return
+	w.pgMu.Lock()
+	pgids := make([]int, 0, len(w.pgids))
+	for pg := range w.pgids {
+		pgids = append(pgids, pg)
+		delete(w.pgids, pg)
 	}
-	self := os.Getpid()
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == self {
-			continue
-		}
-		cwd, err := os.Readlink(filepath.Join("/proc", e.Name(), "cwd"))
-		if err != nil {
-			continue
-		}
-		if cwd == rootAbs || strings.HasPrefix(cwd, rootAbs+string(filepath.Separator)) {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
-		}
+	w.pgMu.Unlock()
+
+	for _, pg := range pgids {
+		// Each RunCommand runs in its own process group (Setpgid), so killing
+		// the group reaches backgrounded children too. ESRCH just means the
+		// group is already gone.
+		_ = syscall.Kill(-pg, syscall.SIGKILL)
 	}
 }
 
@@ -193,6 +219,13 @@ func (w *Workspace) resolve(rel string) (string, error) {
 		return "", fmt.Errorf("path escapes workspace: %s", rel)
 	}
 	return abs, nil
+}
+
+// Resolve maps a relative path to an absolute path inside the workspace,
+// refusing to escape it (exported for callers outside file tools, e.g. the
+// agent's browser target resolution).
+func (w *Workspace) Resolve(rel string) (string, error) {
+	return w.resolve(rel)
 }
 
 func (w *Workspace) WriteFile(rel, content string) error {
@@ -330,6 +363,7 @@ func (w *Workspace) Search(query string) ([]string, error) {
 // It returns combined output, the exit code, and a non-nil error only for
 // execution-level failures (timeout, missing shell), not non-zero exits.
 func (w *Workspace) RunCommand(ctx context.Context, command string) (string, int, error) {
+	root := w.rootPath()
 	timeout := w.commandTimeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -350,7 +384,19 @@ func (w *Workspace) RunCommand(ctx context.Context, command string) (string, int
 	defer os.Remove(outName)
 
 	cmd := exec.CommandContext(cctx, "bash", "-c", command)
-	cmd.Dir = w.root
+	cmd.Dir = root
+	// The agent's shell sees a scrubbed environment: kenosm's own secrets
+	// (SECRET_KEY, DATABASE_URL, KENOSM_API_KEY) must never be readable by a
+	// prompt-injected model. HOME points at the workspace so tool caches stay
+	// contained too.
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + root,
+		"USER=" + os.Getenv("USER"),
+		"LANG=" + os.Getenv("LANG"),
+		"TERM=dumb",
+		"PWD=" + root,
+	}
 	// Run in its own process group so a timeout kills the whole tree,
 	// including backgrounded servers and hanging children.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -363,7 +409,15 @@ func (w *Workspace) RunCommand(ctx context.Context, command string) (string, int
 	cmd.Stdout = outf
 	cmd.Stderr = outf
 
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		// Track the process group so CleanupProcesses can reap backgrounded
+		// children (and only those) when the run ends.
+		w.pgMu.Lock()
+		w.pgids[cmd.Process.Pid] = struct{}{}
+		w.pgMu.Unlock()
+		runErr = cmd.Wait()
+	}
 	_ = outf.Close()
 	raw, _ := os.ReadFile(outName)
 	output := string(raw)

@@ -4,35 +4,143 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>kenosm</title>
+  <link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23ffffff" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3.2" fill="%23ffffff" stroke="none"/><circle cx="12" cy="12" r="8.4" opacity="0.45"/></svg>' />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <header>
-    <div class="brand">kenosm</div>
-    <nav>
-      <button data-tab="agents" class="tab">Agents</button>
-      <button data-tab="swarm" class="tab active">Chat</button>
-      <button data-tab="files" class="tab">Files</button>
-      <button data-tab="stats" class="tab">Stats</button>
-      <button data-tab="tools" class="tab">Tools</button>
+  <!-- Loading splash, fades out when the app is ready. -->
+  <div id="splash">
+    <svg class="splash-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3.2" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="8.4" opacity="0.4"/></svg>
+    <div class="splash-name">kenosm</div>
+    <div class="splash-sub">multi-agent swarm</div>
+    <div class="splash-status" id="splash-status">booting…</div>
+  </div>
+
+  <!-- Sessions: far left, like Claude Code desktop. -->
+  <aside class="sessions-rail">
+    <div class="sessions-head">
+      <span>Sessions</span>
+      <button id="btn-new-chat" class="icon-btn" title="New chat"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>
+    </div>
+    <div id="chat-tabs" class="chats-list"></div>
+  </aside>
+
+  <!-- App rail: chat + gear (everything else lives behind the gear). -->
+  <aside class="rail">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3.2" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="8.4" opacity="0.4"/></svg>
+      <span>kenosm</span>
+    </div>
+    <nav class="rail-nav">
+      <button data-tab="chat" class="tab active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8.5 8.5 0 0 1-8.5 8.5c-1.5 0-3-.4-4.2-1L3 21l1.5-5.3A8.5 8.5 0 1 1 21 12Z"/></svg><span>Chat</span></button>
+      <button id="btn-gear" class="tab" title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55h.01a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1Z"/></svg></button>
     </nav>
-  </header>
+    <div class="rail-foot"><span class="dot" id="server-status"></span></div>
+  </aside>
+
+  <!-- Gear menu -->
+  <div id="gear-menu" class="menu hidden">
+    <button class="menu-item" data-tab="agents"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M16 3.128a4 4 0 0 1 0 7.744"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/></svg>Agents</button>
+    <button class="menu-item" data-tab="files"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>Files</button>
+    <button class="menu-item" data-tab="stats"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>Stats</button>
+    <button class="menu-item" data-tab="tools"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19h8"/><path d="m4 17 6-6-6-6"/></svg>Tool modules</button>
+  </div>
 
   <main>
+    <!-- Chat -->
+    <section id="tab-chat" class="tab-panel active">
+      <div class="chat-layout">
+        <div class="console">
+          <div class="ws-bar">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+            <span class="ws-bar-path" id="ws-bar-root" title="">…</span>
+            <button id="btn-change-folder" class="btn ghost small">Change folder</button>
+          </div>
+          <div class="scroll-wrap">
+            <div id="console-scroll"><div class="msg system" id="console-empty">New chat. Write a message below.</div></div>
+            <button id="btn-follow" class="follow-btn" title="Follow live output"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg></button>
+          </div>
+          <div class="composer">
+            <div class="attach-row">
+              <button id="btn-attach" class="btn ghost small"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"/></svg>Attach file</button>
+              <div id="attachments" class="attachments"></div>
+            </div>
+            <textarea id="task" rows="2" placeholder="Write a message…"></textarea>
+            <div class="composer-bar">
+              <select id="sel-agent" class="sel agent-sel" title="Choose model / agent">
+                <option value="">Auto</option>
+              </select>
+              <div class="mode-pills">
+                <button id="btn-mode-single" class="pill active">Single</button>
+                <button id="btn-mode-swarm" class="pill">Swarm</button>
+                <button id="btn-mode-polish" class="pill">Polish</button>
+              </div>
+              <button id="btn-refine" class="pill pill-solo active" title="Auto-rewrite your idea into a detailed task prompt before the run">Refine idea</button>
+              <span class="reasoning" title="Reasoning level">
+                <span class="reasoning-top"><svg class="icon zap" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.914 4a1.5 1.5 0 0 0-2.474-1.561l-9 9A1.5 1.5 0 0 0 5.5 14h4.002a.5.5 0 0 1 .471.666L8.086 20a1.5 1.5 0 0 0 2.475 1.56l9-9A1.5 1.5 0 0 0 18.5 10h-3.997a.5.5 0 0 1-.472-.667z"/></svg><span>Reasoning Level</span><span class="reasoning-value" id="reasoning-value">Normal</span></span>
+                <span class="reasoning-slider">
+                  <span class="reasoning-ticks"><i></i><i></i><i></i><i></i></span>
+                  <input id="sel-reasoning" type="range" min="0" max="4" step="1" value="2" />
+                </span>
+                <span class="reasoning-ends"><span>Faster</span><span>Smarter</span></span>
+              </span>
+              <button id="btn-mic" class="icon-btn mic" title="Voice input"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19v3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><rect x="9" y="2" width="6" height="13" rx="3"/></svg></button>
+              <span id="run-status" class="status"></span>
+              <button id="btn-stop" class="btn ghost hidden">Stop</button>
+              <button id="btn-run" class="btn">Send</button>
+            </div>
+          </div>
+        </div>
+
+        <aside class="right">
+          <div class="panel">
+            <h3>Browsers <span class="dot" id="live-dot"></span></h3>
+            <div id="browser-tabs" class="browser-tabs"></div>
+            <div class="browser-toolbar">
+              <span class="tdot r"></span><span class="tdot y"></span><span class="tdot g"></span>
+              <span id="browser-url" class="browser-url">—</span>
+            </div>
+            <div class="browser-viewport">
+              <div class="browser-placeholder" id="browser-placeholder">Waiting for an agent to open its browser…</div>
+              <img id="browser-img" class="hidden" alt="agent browser" />
+            </div>
+          </div>
+          <div class="panel">
+            <h3>Files</h3>
+            <div id="sidebar-files" class="file-tree"><span class="hint">Loading…</span></div>
+          </div>
+          <div class="panel">
+            <h3>Usage · live</h3>
+            <div id="live-total" class="live-total">0</div>
+            <div id="live-split" class="hint">in 0 · out 0</div>
+            <div id="live-cost" class="live-cost">$0.0000</div>
+            <div class="sec">Context · avg free</div>
+            <div class="ctx-row"><span class="ctx-val" id="ctx-left">—</span><span class="ctx-sub" id="ctx-detail"></span></div>
+            <div class="bar-track ctx-bar"><div class="bar-fill" id="ctx-fill" style="width:0%"></div></div>
+            <div class="sec">by model</div>
+            <div id="live-by-model" class="bars"></div>
+            <div class="sec">by agent</div>
+            <div id="live-by-agent" class="bars"></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
     <!-- Agents -->
     <section id="tab-agents" class="tab-panel">
-      <div class="toolbar">
-        <h2>Agents</h2>
+      <div class="page-head">
+        <div>
+          <h2>Agents</h2>
+          <p class="hint" id="models-info"></p>
+        </div>
         <button id="btn-new-agent" class="btn">Add agent</button>
       </div>
-      <p class="hint">Each agent is an API key bound to a SOCKS5 proxy. Keys and proxy passwords are stored encrypted.</p>
       <div id="agents-list" class="list"></div>
-
-      <div id="agent-form" class="panel hidden">
+      <div id="agent-form" class="panel form-panel hidden">
         <h3 id="agent-form-title">Add agent</h3>
         <div class="grid">
-          <label>Name<input id="f-name" placeholder="Gemini A" /></label>
-          <label>Slug<input id="f-slug" placeholder="gemini-a" /></label>
+          <label>Name<input id="f-name" /></label>
+          <label>Slug<input id="f-slug" /></label>
           <label>Base URL<input id="f-baseurl" value="https://generativelanguage.googleapis.com/v1beta" /></label>
           <label>Provider
             <select id="f-provider">
@@ -40,10 +148,10 @@
               <option value="openai">DeepSeek (OpenAI)</option>
             </select>
           </label>
-          <label>Model (empty = auto)<input id="f-model" placeholder="auto" /></label>
+          <label>Model (empty = auto)<input id="f-model" /></label>
           <label>API key<input id="f-key" type="password" autocomplete="off" /></label>
-          <label>Proxy host<input id="f-phost" placeholder="127.0.0.1" /></label>
-          <label>Proxy port<input id="f-pport" type="number" placeholder="1080" /></label>
+          <label>Proxy host<input id="f-phost" /></label>
+          <label>Proxy port<input id="f-pport" type="number" /></label>
           <label>Proxy username<input id="f-puser" autocomplete="off" /></label>
           <label>Proxy password<input id="f-ppass" type="password" autocomplete="off" /></label>
           <label class="check">Enabled<input id="f-enabled" type="checkbox" checked /></label>
@@ -55,75 +163,19 @@
       </div>
     </section>
 
-    <!-- Chat: a Claude-Code-like conversation with a single-agent / swarm toggle. Left = chat, right = live stats. -->
-    <section id="tab-swarm" class="tab-panel active">
-      <div class="swarm-layout">
-        <div class="console">
-          <div class="console-head">
-            <div class="chat-tabs" id="chat-tabs"></div>
-            <button id="btn-new-chat" class="btn small">New chat</button>
-          </div>
-          <div class="console-scroll" id="console-scroll">
-            <div class="msg system" id="console-empty">New chat. Write a message below.</div>
-          </div>
-          <div class="console-input">
-            <div class="attach-row">
-              <button id="btn-attach" class="btn small ghost">Attach image</button>
-              <input type="file" id="file-input" accept="image/*" multiple hidden />
-              <span class="hint">Attach images to the next message.</span>
-            </div>
-            <div id="attachments" class="attachments"></div>
-            <textarea id="task" rows="2" placeholder="Write a message…"></textarea>
-            <div class="input-bar">
-              <button id="btn-prompt-gen" class="btn small ghost" title="Rewrite a rough idea into a task prompt">Generate prompt</button>
-              <div class="mode-toggle">
-                <button id="btn-mode-single" class="btn small active">Single</button>
-                <button id="btn-mode-swarm" class="btn small">Swarm</button>
-                <button id="btn-mode-polish" class="btn small">Polish</button>
-              </div>
-              <button id="btn-run" class="btn">Send</button>
-              <button id="btn-stop" class="btn ghost hidden">Stop</button>
-              <span id="run-status" class="hint"></span>
-            </div>
-          </div>
-        </div>
-
-        <aside class="sidebar">
-          <div class="panel">
-            <h3>Swarm (live)</h3>
-            <div id="swarm-graph" class="swarm-graph"></div>
-            <div class="live-section">agents talking</div>
-            <div id="swarm-chat" class="swarm-chat"></div>
-          </div>
-          <div class="panel">
-            <h3>Models</h3>
-            <div id="models-info" class="hint"></div>
-          </div>
-          <div class="panel">
-            <h3>Usage (live)</h3>
-            <div id="live-total" class="live-total">0</div>
-            <div id="live-split" class="live-split hint">in 0 · out 0 · think 0</div>
-            <div id="live-cost" class="live-cost">$0.0000</div>
-            <div class="ls-divider"></div>
-            <div class="live-section">spend by model</div>
-            <div id="live-cost-model" class="live-bars"></div>
-            <div class="live-section">by model</div>
-            <div id="live-by-model" class="live-bars"></div>
-            <div class="live-section">by agent</div>
-            <div id="live-by-agent" class="live-bars"></div>
-            <div class="ls-divider"></div>
-            <div class="live-section">activity (reads / writes)</div>
-            <div id="live-feed" class="live-feed"></div>
-          </div>
-        </aside>
-      </div>
-    </section>
-
     <!-- Files -->
     <section id="tab-files" class="tab-panel">
-      <h2>Workspace files</h2>
-      <p class="hint">Files created by the agents.</p>
-      <div id="files-list" class="list"></div>
+      <div class="page-head">
+        <div><h2>Workspace files</h2><p class="hint">What the agents have written.</p></div>
+        <button id="btn-clear-ws" class="btn ghost">Clear workspace</button>
+      </div>
+      <div class="ws-root-row">
+        <span class="hint">Working folder:</span>
+        <input id="ws-root" placeholder="/path/to/project" />
+        <button id="btn-browse-dir" class="btn small">Browse…</button>
+        <button id="btn-set-root" class="btn small">Set</button>
+      </div>
+      <div id="files-list" class="file-tree files-tree-full"></div>
       <div id="file-viewer" class="panel hidden">
         <h3 id="file-viewer-title"></h3>
         <pre id="file-viewer-content"></pre>
@@ -132,60 +184,53 @@
 
     <!-- Stats -->
     <section id="tab-stats" class="tab-panel">
-      <h2>Usage stats</h2>
-      <p class="hint">Token usage and API spend across swarm runs, grouped by model, agent (API key) and run. Updates live.</p>
+      <h2>Usage</h2>
       <div id="stat-totals" class="stat-grid"></div>
       <h3>By model</h3>
       <div id="stat-by-model" class="list"></div>
-      <h3>By agent (API key)</h3>
+      <h3>By agent</h3>
       <div id="stat-by-agent" class="list"></div>
       <h3>By run</h3>
       <div id="stat-by-run" class="list"></div>
-      <h3>Run distribution (parallel)</h3>
-      <p class="hint">Which agent ran each subtask and when. Bars that overlap show agents working in parallel.</p>
-      <div class="row">
-        <select id="timeline-run" style="max-width:340px"></select>
-      </div>
+      <h3>Run distribution</h3>
+      <select id="timeline-run" style="max-width:360px"></select>
       <div id="timeline" class="timeline"></div>
     </section>
 
-    <!-- Tool modules -->
+    <!-- Tools -->
     <section id="tab-tools" class="tab-panel">
       <h2>Tool modules</h2>
-      <p class="hint">Groups of agent tools you can turn on or off. Changes apply to the next run and reset to DISABLED_MODULES on restart.</p>
+      <p class="hint">Groups of agent tools you can turn on or off. Changes apply to the next run.</p>
       <div id="modules-list" class="list"></div>
     </section>
   </main>
 
-  <div id="modal" class="modal hidden">
+  <!-- Folder picker: browse any directory on the host, not just the workspace. -->
+  <div id="dir-modal" class="modal hidden">
     <div class="modal-box">
-      <h3 id="modal-title">Are you sure?</h3>
-      <p id="modal-msg"></p>
-      <div class="modal-actions">
-        <button id="modal-cancel" class="btn ghost">Cancel</button>
-        <button id="modal-confirm" class="btn danger">I'm sure</button>
+      <div class="modal-head">
+        <h3>Choose working folder</h3>
+        <button id="dir-close" class="icon-btn" title="Close"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
       </div>
-    </div>
-  </div>
-
-  <div id="prompt-modal" class="modal hidden">
-    <div class="modal-box modal-wide">
-      <h3>Generate task prompt</h3>
-      <p class="hint">Paste a rough idea. The model rewrites it into a detailed, self-contained task prompt you can copy or drop straight into the chat.</p>
-      <textarea id="prompt-idea" rows="4" placeholder="Rough idea…"></textarea>
+      <div class="dir-nav">
+        <input id="dir-input" placeholder="Type or paste a path…" />
+        <button id="dir-go" class="btn small">Go</button>
+      </div>
+      <div class="dir-path" id="dir-path">/</div>
+      <div class="dir-nav">
+        <button id="dir-up" class="btn ghost small">Up</button>
+        <button id="dir-home" class="btn ghost small">Home</button>
+      </div>
+      <div id="dir-list" class="dir-list"></div>
       <div class="row">
-        <button id="btn-prompt-generate" class="btn">Generate</button>
-        <span id="prompt-status" class="hint"></span>
-      </div>
-      <textarea id="prompt-result" rows="10" placeholder="The refined prompt will appear here…" readonly></textarea>
-      <div class="modal-actions">
-        <button id="btn-prompt-copy" class="btn ghost">Copy</button>
-        <button id="btn-prompt-use" class="btn">Use in chat</button>
-        <button id="btn-prompt-close" class="btn ghost">Close</button>
+        <button id="dir-select" class="btn">Use this folder</button>
+        <button id="dir-cancel" class="btn ghost">Cancel</button>
       </div>
     </div>
   </div>
 
+  <input type="file" id="file-input" multiple hidden />
+  <script src="/vendor/mermaid.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

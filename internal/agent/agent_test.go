@@ -1,11 +1,64 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"kenosm/internal/browser"
 	"kenosm/internal/desktop"
+	"kenosm/internal/llm"
 )
+
+func TestCompactHistoryPreservesAlternation(t *testing.T) {
+	turn := func(role string) llm.Turn { return llm.Turn{Role: role, Text: "x"} }
+	mk := func(n int) []llm.Turn {
+		h := []llm.Turn{turn("user")} // task
+		for i := 0; i < n; i++ {
+			h = append(h, turn("model"), turn("user"))
+		}
+		return h
+	}
+
+	// Under the cap: unchanged.
+	small := mk(5)
+	if got := compactHistoryBudget(small, defaultHistoryMaxBytes); len(got) != len(small) {
+		t.Fatalf("small history must stay intact, got %d turns", len(got))
+	}
+
+	// Over the cap: pairs dropped, task kept, alternation valid.
+	big := mk(30)
+	got := compactHistoryBudget(big, defaultHistoryMaxBytes)
+	if len(got) > historyMaxTurns {
+		t.Fatalf("compacted to %d turns, cap is %d", len(got), historyMaxTurns)
+	}
+	if got[0].Role != "user" {
+		t.Fatal("task turn must survive compaction")
+	}
+	for i := 1; i < len(got); i += 2 {
+		if got[i].Role != "model" || (i+1 < len(got) && got[i+1].Role != "user") {
+			t.Fatalf("alternation broken at %d: %s then %s", i, got[i].Role, got[i+1].Role)
+		}
+	}
+}
+
+func TestCompactHistoryDropsOversizedContent(t *testing.T) {
+	h := []llm.Turn{
+		{Role: "user", Text: "task"},
+		{Role: "model", Text: "thinking"},
+		{Role: "user", Text: strings.Repeat("a", 20*1024), ToolResponses: []llm.FunctionResponse{{Response: map[string]any{"content": strings.Repeat("b", 20*1024)}}}},
+		{Role: "model", Text: "thinking"},
+		{Role: "user", Text: strings.Repeat("c", 20*1024), ToolResponses: []llm.FunctionResponse{{Response: map[string]any{"content": strings.Repeat("d", 20*1024)}}}},
+		{Role: "model", Text: "thinking"},
+		{Role: "user", Text: "final"},
+	}
+	got := compactHistoryBudget(h, defaultHistoryMaxBytes)
+	if historyBytes(got) > defaultHistoryMaxBytes {
+		t.Fatalf("compacted history is %d bytes, cap %d", historyBytes(got), defaultHistoryMaxBytes)
+	}
+	if got[0].Text != "task" || got[len(got)-1].Text != "final" {
+		t.Fatal("task and newest turns must survive")
+	}
+}
 
 func TestCleanRelPath(t *testing.T) {
 	cases := map[string]string{

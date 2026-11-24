@@ -47,11 +47,12 @@ type Swarm struct {
 	disabledModules    map[string]bool // tool modules disabled at runtime
 	sem                chan struct{}   // bounds concurrent runs (spawning browsers + model calls)
 	polishMaxRounds    int             // max self-review rounds in polish mode
+	goalMaxRounds      int             // max goal-verification fix rounds per swarm run
 	agentMaxIterations int             // max agent tool-call turns per subtask
 }
 
-func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo, tc *transport.Cache, disabledModules []string, maxConcurrent, polishMaxRounds, agentMaxIterations int) *Swarm {
-	if maxConcurrent <= 0 {
+func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *repository.ChatRepo, orchestratorModel, defaultModel string, availableModels []string, ws *workspace.Workspace, br *browser.Browser, dsk *desktop.Desktop, prices pricing.Table, activity *repository.ActivityRepo, tc *transport.Cache, disabledModules []string, maxConcurrent, polishMaxRounds, goalMaxRounds, agentMaxIterations int) *Swarm {
+	if maxConcurrent < 0 {
 		maxConcurrent = 1
 	}
 	if polishMaxRounds <= 0 {
@@ -59,6 +60,10 @@ func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *
 	}
 	if agentMaxIterations <= 0 {
 		agentMaxIterations = 50
+	}
+	var sem chan struct{}
+	if maxConcurrent > 0 {
+		sem = make(chan struct{}, maxConcurrent)
 	}
 	return &Swarm{
 		repo:               repo,
@@ -75,8 +80,9 @@ func NewSwarm(repo *repository.ServiceRepo, usage *repository.UsageRepo, chats *
 		activity:           activity,
 		transportCache:     tc,
 		disabledModules:    moduleSet(disabledModules),
-		sem:                make(chan struct{}, maxConcurrent),
+		sem:                sem,
 		polishMaxRounds:    polishMaxRounds,
+		goalMaxRounds:      goalMaxRounds,
 		agentMaxIterations: agentMaxIterations,
 	}
 }
@@ -92,11 +98,26 @@ func moduleSet(names []string) map[string]bool {
 	return m
 }
 
+// runsDisabled reports whether run execution was turned off via
+// MAX_CONCURRENT_RUNS=0 (the semaphore is nil then).
+func (h *Swarm) runsDisabled() bool {
+	return h.sem == nil
+}
+
+// Busy reports whether any run is still executing (used to refuse destructive
+// workspace operations while agents are working).
+func (h *Swarm) Busy() bool {
+	return h.registry.active() > 0
+}
+
 // tryAcquireRun reserves a slot for a concurrent run, returning false when the
 // server is already at its configured limit. It bounds the number of concurrent
 // agent swarms (each spawning browsers and model calls) and, with the default
 // limit of one, keeps two runs from stomping on the shared workspace.
 func (h *Swarm) tryAcquireRun() bool {
+	if h.sem == nil {
+		return false
+	}
 	select {
 	case h.sem <- struct{}{}:
 		return true
@@ -106,7 +127,9 @@ func (h *Swarm) tryAcquireRun() bool {
 }
 
 func (h *Swarm) releaseRun() {
-	<-h.sem
+	if h.sem != nil {
+		<-h.sem
+	}
 }
 
 // Run starts a background run (defaulting to swarm mode) and returns its run ID
@@ -119,10 +142,12 @@ func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 			MimeType string `json:"mime_type"`
 			Data     string `json:"data"` // base64-encoded bytes, optionally a full data URL
 		} `json:"images"`
-		Mode string `json:"mode"`
+		Mode      string `json:"mode"`
+		ContextKB int    `json:"context_kb"` // context-window budget in KiB (0 = default)
+		Reasoning string `json:"reasoning"`  // fast | normal | deep
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if err := decodeJSON(w, r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if strings.TrimSpace(in.Task) == "" {
@@ -141,6 +166,10 @@ func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
+	if h.runsDisabled() {
+		writeError(w, http.StatusServiceUnavailable, "runs are disabled (MAX_CONCURRENT_RUNS=0)")
+		return
+	}
 	if !h.tryAcquireRun() {
 		writeError(w, http.StatusTooManyRequests, "too many concurrent runs")
 		return
@@ -150,7 +179,8 @@ func (h *Swarm) Run(w http.ResponseWriter, r *http.Request) {
 	if mode != modeSingle && mode != modeSwarm && mode != modePolish {
 		mode = modeSwarm
 	}
-	runID, _ := h.runTurn(agents, in.Task, images, nil, mode, nil, nil, nil)
+	opts := runOptions{ContextBytes: in.ContextKB * 1024, ReasoningLevel: in.Reasoning}
+	runID, _ := h.runTurn(agents, in.Task, images, nil, mode, opts, nil, nil, nil)
 
 	writeJSON(w, http.StatusAccepted, map[string]string{"run_id": runID})
 }
@@ -170,7 +200,21 @@ func (h *Swarm) loadAgents(ctx context.Context) ([]swarm.Agent, error) {
 
 // newSwarm builds a swarm instance with the handler's runtime configuration,
 // shared by runTurn and the single-turn prompt generator.
-func (h *Swarm) newSwarm(agents []swarm.Agent, emitter swarm.Emitter) *swarm.Swarm {
+func (h *Swarm) newSwarm(agents []swarm.Agent, emitter swarm.Emitter, opts runOptions) *swarm.Swarm {
+	maxIt := h.agentMaxIterations
+	switch opts.ReasoningLevel {
+	case "min":
+		maxIt = 8
+	case "low":
+		maxIt = 12
+	case "high":
+		maxIt = 90
+	case "max":
+		maxIt = 120
+	}
+	if maxIt <= 0 {
+		maxIt = 50
+	}
 	return swarm.New(swarm.Config{
 		Agents:            agents,
 		OrchestratorModel: h.orchestratorModel,
@@ -183,7 +227,9 @@ func (h *Swarm) newSwarm(agents []swarm.Agent, emitter swarm.Emitter) *swarm.Swa
 		Emitter:           emitter,
 		TransportCache:    h.transportCache,
 		PolishMaxRounds:   h.polishMaxRounds,
-		MaxIterations:     h.agentMaxIterations,
+		GoalMaxRounds:     h.goalMaxRounds,
+		MaxIterations:     maxIt,
+		ContextBytes:      opts.ContextBytes,
 	})
 }
 
@@ -194,8 +240,8 @@ func (h *Swarm) GeneratePrompt(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Idea string `json:"idea"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if err := decodeJSON(w, r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if strings.TrimSpace(in.Idea) == "" {
@@ -211,7 +257,7 @@ func (h *Swarm) GeneratePrompt(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
 	defer cancel()
-	prompt, err := h.newSwarm(agents, nil).GeneratePrompt(ctx, in.Idea)
+	prompt, err := h.newSwarm(agents, nil, runOptions{}).GeneratePrompt(ctx, in.Idea)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -226,7 +272,15 @@ func (h *Swarm) GeneratePrompt(w http.ResponseWriter, r *http.Request) {
 // "done" event is emitted (used to persist the assistant message into a chat).
 // onError/onStop receive the turn's failure/stop so a chat can keep its
 // user/assistant alternation intact.
-func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, prior []llm.Turn, mode string, onDone func(*swarm.Result), onError func(string), onStop func()) (string, *runState) {
+// runOptions carries per-turn tuning: the context-window budget (bytes, 0 =
+// default) and the reasoning level (fast/normal/deep), which maps to the
+// agent's tool-call iteration budget.
+type runOptions struct {
+	ContextBytes   int
+	ReasoningLevel string
+}
+
+func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, prior []llm.Turn, mode string, opts runOptions, onDone func(*swarm.Result), onError func(string), onStop func()) (string, *runState) {
 	runID, state := h.registry.create()
 	state.add(swarm.Event{Time: time.Now(), Type: "start", Detail: "run started"})
 
@@ -246,7 +300,7 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 		}
 	}
 
-	sw := h.newSwarm(agents, emitter)
+	sw := h.newSwarm(agents, emitter, opts)
 
 	// A fresh context lets the run outlive the HTTP request; its cancel is wired
 	// into the registry synchronously so Stop works even if called immediately.
@@ -262,7 +316,10 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(h.releaseRun) }
 
+	workerDone := make(chan struct{})
 	go func() {
+		defer close(workerDone)
+		defer state.markExited()
 		defer cancel()
 		defer cancelRun()
 		defer release()
@@ -301,11 +358,20 @@ func (h *Swarm) runTurn(agents []swarm.Agent, task string, images []llm.Image, p
 	}()
 
 	// Watchdog: bound the semaphore slot by the run context itself, independent of
-	// the worker goroutine's liveness. If a worker hangs in a tool that ignores
-	// cancellation, this releases the slot on Stop (or at the run deadline) so the
-	// next task can start instead of getting "too many concurrent runs".
+	// the worker goroutine's liveness. A normal cancellation unwinds the worker
+	// within seconds (HTTP calls, browsers and shell commands all honor ctx);
+	// the grace period lets it exit before the slot is freed, so a still-running
+	// worker does not collide with the next run on the shared workspace. If a
+	// worker hangs in a call that ignores cancellation, the slot is released
+	// after the grace period anyway — a stuck agent can never wedge
+	// MAX_CONCURRENT_RUNS forever.
+	const releaseGrace = 10 * time.Second
 	go func() {
 		<-runCtx.Done()
+		select {
+		case <-workerDone:
+		case <-time.After(releaseGrace):
+		}
 		release()
 	}()
 
@@ -409,10 +475,11 @@ func (h *Swarm) insertActivity(runID string, e swarm.Event) {
 }
 
 func truncateText(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(r[:n]) + "..."
 }
 
 // Events streams the progress of one run as Server-Sent Events. Each event is
@@ -440,10 +507,18 @@ func (h *Swarm) Events(w http.ResponseWriter, r *http.Request) {
 	ch := state.subscribe()
 	defer state.unsubscribe(ch)
 
+	// Heartbeat keeps the stream alive through idle stretches so reverse
+	// proxies don't reap the connection mid-run.
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-heartbeat.C:
+			_, _ = fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
 		case e, ok := <-ch:
 			if !ok {
 				return
@@ -463,6 +538,35 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, e swarm.Event) {
 	}
 	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
+}
+
+// Browsers returns the latest live viewport snapshot of every agent browser in
+// the run — the initial state for the frontend's "watch the agents work" grid.
+// Live updates then arrive as browser_frame events on the run's SSE stream.
+func (h *Swarm) Browsers(w http.ResponseWriter, r *http.Request) {
+	runID := chi.URLParam(r, "runID")
+	state := h.registry.get(runID)
+	if state == nil {
+		writeError(w, http.StatusNotFound, "run not found")
+		return
+	}
+	frames := state.browserFrames()
+	if frames == nil {
+		frames = []swarm.Event{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"frames": frames})
+}
+
+// LatestBrowsers returns the browser frames of the most recent run that has
+// any — the right-panel browser view works even when the page was reloaded
+// mid-run and missed the SSE stream.
+func (h *Swarm) LatestBrowsers(w http.ResponseWriter, _ *http.Request) {
+	state := h.registry.latestWithFrames()
+	frames := []swarm.Event{}
+	if state != nil {
+		frames = state.browserFrames()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"frames": frames})
 }
 
 func (h *Swarm) Models(w http.ResponseWriter, _ *http.Request) {
@@ -496,8 +600,8 @@ func (h *Swarm) SetModule(w http.ResponseWriter, r *http.Request) {
 		Name    string `json:"name"`
 		Enabled bool   `json:"enabled"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if err := decodeJSON(w, r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	name := strings.TrimSpace(in.Name)

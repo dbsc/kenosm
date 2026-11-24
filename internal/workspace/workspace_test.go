@@ -2,9 +2,13 @@ package workspace
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -203,5 +207,83 @@ func TestRunCommandDoesNotHangOnBackgroundChild(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Fatalf("RunCommand blocked for %s waiting on a background child", elapsed)
+	}
+}
+
+func TestRunCommandScrubsEnvironment(t *testing.T) {
+	w := newTestWorkspace(t)
+	t.Setenv("SECRET_KEY", "hunter2")
+	t.Setenv("DATABASE_URL", "postgres://secret")
+	t.Setenv("KENOSM_API_KEY", "apikey")
+
+	out, code, err := w.RunCommand(context.Background(),
+		`printf '%s' "$SECRET_KEY$DATABASE_URL$KENOSM_API_KEY"`)
+	if err != nil {
+		t.Fatalf("RunCommand: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if out != "" {
+		t.Fatalf("shell leaked kenosm secrets: %q", out)
+	}
+}
+
+func TestCleanupProcessesOnlyKillsTracked(t *testing.T) {
+	w := newTestWorkspace(t)
+
+	// An unrelated process with its cwd inside the workspace (e.g. the user's
+	// own terminal or server) must survive cleanup.
+	foreign := exec.Command("sleep", "60")
+	foreign.Dir = w.Root()
+	foreign.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := foreign.Start(); err != nil {
+		t.Fatalf("start foreign process: %v", err)
+	}
+	t.Cleanup(func() { _ = foreign.Process.Kill() })
+
+	// A background child started through RunCommand must be reaped.
+	if _, _, err := w.RunCommand(context.Background(), "sleep 60 & echo $! > tracked.pid"); err != nil {
+		t.Fatalf("RunCommand: %v", err)
+	}
+	pidRaw, err := w.ReadFile("tracked.pid")
+	if err != nil {
+		t.Fatalf("read tracked pid: %v", err)
+	}
+	trackedPID, err := strconv.Atoi(strings.TrimSpace(pidRaw))
+	if err != nil {
+		t.Fatalf("parse tracked pid %q: %v", pidRaw, err)
+	}
+
+	w.CleanupProcesses()
+
+	if !alive(foreign.Process.Pid) {
+		t.Fatal("cleanup killed an unrelated process that merely had its cwd in the workspace")
+	}
+	if alive(trackedPID) {
+		t.Fatal("cleanup did not kill a background child started via RunCommand")
+	}
+}
+
+// alive reports whether a process is still live (not dead and not a zombie).
+// It polls briefly: SIGKILL delivery is asynchronous, so a just-killed process
+// can still report R/S for a few scheduling ticks.
+func alive(pid int) bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := syscall.Kill(pid, 0)
+		if err != nil {
+			return false // ESRCH: gone
+		}
+		if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+			fields := strings.Fields(string(data))
+			if len(fields) >= 3 && fields[2] == "Z" {
+				return false // zombie
+			}
+		}
+		if time.Now().After(deadline) {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

@@ -2,6 +2,7 @@ package swarm
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -57,15 +58,69 @@ type Config struct {
 	Emitter           Emitter          // optional progress-event sink
 	TransportCache    *transport.Cache // optional; reuses pooled SOCKS5 transports across agents/runs
 	PolishMaxRounds   int              // max self-review rounds for RunPolish (0 = 3)
+	GoalMaxRounds     int              // max goal-verification fix rounds for Run (0 = 2)
 	MaxIterations     int              // max agent tool-call turns per subtask (0 = 50)
+	ContextBytes      int              // context-window budget for agent history compaction (0 = 48 KiB)
 }
 
 type Swarm struct {
 	cfg Config
+
+	mu       sync.Mutex
+	sessions map[string]*browser.Session // live agent browsers, keyed by agent name (for the live-view frame ticker)
 }
 
 func New(cfg Config) *Swarm {
-	return &Swarm{cfg: cfg}
+	return &Swarm{cfg: cfg, sessions: map[string]*browser.Session{}}
+}
+
+// registerSession records an agent's live browser session so the frame ticker
+// can stream its viewport to the frontend.
+func (s *Swarm) registerSession(name string, sess *browser.Session) {
+	if sess == nil {
+		return
+	}
+	s.mu.Lock()
+	s.sessions[name] = sess
+	s.mu.Unlock()
+}
+
+// startBrowserFrames streams each live agent browser's viewport (URL, title,
+// PNG) as browser_frame events every interval while the run is active. This is
+// the "watch the agents work" view: the frontend renders each agent's browser
+// as a live mini-window.
+func (s *Swarm) startBrowserFrames(ctx context.Context, interval time.Duration) {
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.mu.Lock()
+				snapshot := make(map[string]*browser.Session, len(s.sessions))
+				for k, v := range s.sessions {
+					snapshot[k] = v
+				}
+				s.mu.Unlock()
+				for name, sess := range snapshot {
+					url, title, png := sess.Latest()
+					if len(png) == 0 {
+						continue // closed or never loaded: nothing to show
+					}
+					s.emit(Event{
+						Time:  time.Now(),
+						Type:  "browser_frame",
+						Agent: name,
+						URL:   url,
+						Title: title,
+						Image: base64.StdEncoding.EncodeToString(png),
+					})
+				}
+			}
+		}
+	}()
 }
 
 type TranscriptEntry struct {
@@ -118,6 +173,10 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 		return nil, fmt.Errorf("no agents configured")
 	}
 	res := &Result{Task: task}
+
+	// Stream each agent's live browser viewport to the frontend while the run
+	// is active (the "watch the agents work" view).
+	s.startBrowserFrames(ctx, 2*time.Second)
 
 	// Reap any background servers the agents leave running when we finish,
 	// whether the run completes, errors, or is stopped.
@@ -204,14 +263,20 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	// runnable the moment its prerequisites finish (no wave barrier), and an
 	// agent that finishes early immediately steals the next runnable step — so
 	// all agents stay busy. Blocked work is re-decomposed on demand.
+	beforeSet := s.snapshotFiles()
 	subResults, usage := s.execute(ctx, orch, task, plan, contract, assignments, deps, systemExtra, agents)
 	res.Subtasks = subResults
 	res.Usage = append(res.Usage, usage...)
 
-	if s.cfg.Workspace != nil {
-		files, _ := s.cfg.Workspace.ListFiles()
-		res.Files = files
-	}
+	res.Files, _ = s.listFiles()
+	s.verifyAndFix(ctx, orch, task, res, systemExtra, beforeSet, func(fixPlan []string, digest string) ([]SubtaskResult, []UsageRecord) {
+		fixExtra := systemExtra
+		if digest != "" {
+			fixExtra += "\n\nAlready completed in this run (reuse these results, do not redo them):\n" + digest
+		}
+		fixSubs, fixUsage := s.execute(ctx, orch, task, fixPlan, contract, assignments, nil, fixExtra, agents)
+		return fixSubs, fixUsage
+	})
 
 	var sb strings.Builder
 	for _, sr := range res.Subtasks {
@@ -219,16 +284,237 @@ func (s *Swarm) Run(ctx context.Context, task string, images []llm.Image, prior 
 	}
 
 	// Ask one agent to turn the raw per-subtask notes into a single, clean,
-	// human-readable answer. If that fails (or comes back empty), fall back to
-	// the raw notes so the user still gets something.
+	// human-readable answer. The summary is grounded in the verified file list
+	// so it counts real results, not claimed ones. If that fails (or comes
+	// back empty), fall back to the raw notes so the user still gets something.
 	res.Final = sb.String()
-	if final, model, usage, err := s.finalize(ctx, agents[0], task, subResults); err == nil && strings.TrimSpace(final) != "" {
+	if final, model, usage, err := s.finalize(ctx, agents[0], task, res.Subtasks, res.Files); err == nil && strings.TrimSpace(final) != "" {
 		res.Final = final
 		res.Usage = append(res.Usage, UsageRecord{Agent: agents[0].Name, Model: model, Usage: usage})
 		s.emit(Event{Time: time.Now(), Type: "usage", Agent: agents[0].Name, Model: model, Usage: usage})
 	}
 
 	return res, nil
+}
+
+// goalVerdict is the decoded output of the goal-verification pass: either the
+// task's deliverable is fully present on disk, or there is a concrete gap plus
+// a plan of fix subtasks (with alternative approaches) to close it.
+type goalVerdict struct {
+	Done    bool     `json:"done"`
+	Gaps    string   `json:"gaps"`
+	FixPlan []string `json:"fix_plan"`
+}
+
+// verifyAndFix runs the goal-verification loop for a finished execution. It
+// judges the task against the files this run ACTUALLY produced (newFiles), and
+// while the goal is unmet it plans and executes fix rounds through exec. The
+// loop stops when the verifier signs off, the round budget is exhausted, a
+// round makes no measurable progress, or the verifier can't produce a plan.
+func (s *Swarm) verifyAndFix(ctx context.Context, orch llm.Client, task string, res *Result, systemExtra string, beforeSet map[string]bool, exec func(fixPlan []string, digest string) ([]SubtaskResult, []UsageRecord)) {
+	goalRounds := s.cfg.GoalMaxRounds
+	if goalRounds < 0 {
+		goalRounds = 2 // unset fallback: a reasonable default budget
+	}
+	newFiles := s.newFilesSince(beforeSet)
+	for round := 0; round < goalRounds; round++ {
+		verdict := s.verifyGoal(ctx, orch, task, res.Subtasks, newFiles)
+		if verdict.Done {
+			break
+		}
+		if len(verdict.FixPlan) == 0 {
+			s.emit(Event{Time: time.Now(), Type: "verify", Detail: "goal not met, but the orchestrator produced no fix plan: " + truncate(verdict.Gaps, 400)})
+			break
+		}
+		s.emit(Event{Time: time.Now(), Type: "verify", Detail: "goal not met yet: " + truncate(verdict.Gaps, 400)})
+		s.emit(Event{Time: time.Now(), Type: "fix_round", Detail: fmt.Sprintf("fix round %d/%d: %d more subtasks to close the gaps", round+1, goalRounds, len(verdict.FixPlan))})
+
+		fixSubs, fixUsage := exec(verdict.FixPlan, s.subtaskDigest(res.Subtasks))
+		res.Subtasks = append(res.Subtasks, fixSubs...)
+		res.Usage = append(res.Usage, fixUsage...)
+		res.Files, _ = s.listFiles()
+
+		updated := s.newFilesSince(beforeSet)
+		if !fileSetGrew(newFiles, updated) {
+			s.emit(Event{Time: time.Now(), Type: "verify", Detail: fmt.Sprintf("fix round made no measurable progress (%d new files before, %d after) — stopping", len(newFiles), len(updated))})
+			break
+		}
+		newFiles = updated
+	}
+}
+
+// isTransientFile reports whether a workspace path is an agent self-screenshot
+// (the "eyes" of the browser/desktop tools) rather than a task deliverable.
+// These are excluded from goal verification so transient screenshots don't
+// masquerade as the run's output or keep the fix loop reporting progress forever.
+func isTransientFile(path string) bool {
+	return path == "screenshots" || strings.HasPrefix(path, "screenshots/")
+}
+
+// snapshotFiles captures the workspace file set at the start of a run, so the
+// verification pass can tell what THIS run produced apart from everything that
+// was already on disk.
+func (s *Swarm) snapshotFiles() map[string]bool {
+	out := map[string]bool{}
+	if s.cfg.Workspace == nil {
+		return out
+	}
+	if files, err := s.cfg.Workspace.ListFiles(); err == nil {
+		for _, f := range files {
+			if isTransientFile(f.Path) {
+				continue
+			}
+			out[f.Path] = true
+		}
+	}
+	return out
+}
+
+// newFilesSince returns the files (with sizes) created since the snapshot.
+func (s *Swarm) newFilesSince(before map[string]bool) []workspace.FileInfo {
+	var out []workspace.FileInfo
+	if s.cfg.Workspace == nil {
+		return out
+	}
+	files, err := s.cfg.Workspace.ListFiles()
+	if err != nil {
+		return out
+	}
+	for _, f := range files {
+		if isTransientFile(f.Path) {
+			continue
+		}
+		if !before[f.Path] {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// fileSetGrew reports whether the second set adds files or adds bytes — the
+// measurable-progress signal for a fix round.
+func fileSetGrew(a, b []workspace.FileInfo) bool {
+	if len(b) > len(a) {
+		return true
+	}
+	var sa, sb int64
+	for _, f := range a {
+		sa += f.Size
+	}
+	for _, f := range b {
+		sb += f.Size
+	}
+	return sb > sa
+}
+
+// listFiles returns the workspace file list, or nil when the workspace is off.
+func (s *Swarm) listFiles() ([]workspace.FileInfo, error) {
+	if s.cfg.Workspace == nil {
+		return nil, nil
+	}
+	return s.cfg.Workspace.ListFiles()
+}
+
+// verifyGoal asks the orchestrator model to judge the task against the
+// VERIFIED outcomes — the files this run produced and per-subtask errors — and,
+// if the deliverable is incomplete, to plan a fix round. The fix plan must
+// name alternative approaches (different sites, different methods) for
+// whatever failed, so a failed attempt is replaced by a different attempt,
+// not repeated.
+func (s *Swarm) verifyGoal(ctx context.Context, orch llm.Client, task string, subs []SubtaskResult, newFiles []workspace.FileInfo) goalVerdict {
+	var sb strings.Builder
+	sb.WriteString("Task:\n")
+	sb.WriteString(task)
+	sb.WriteString("\n\nWhat each subtask reported:\n")
+	for _, sr := range subs {
+		if sr.Error != "" {
+			sb.WriteString(fmt.Sprintf("- [%s] %s: FAILED: %s\n", sr.Agent, truncate(sr.Task, 120), truncate(sr.Error, 200)))
+			continue
+		}
+		files := ""
+		if len(sr.Files) > 0 {
+			files = " files: " + strings.Join(sr.Files, ", ")
+		}
+		sb.WriteString(fmt.Sprintf("- [%s] %s: %s%s\n", sr.Agent, truncate(sr.Task, 120), truncate(sr.Summary, 300), files))
+	}
+	sb.WriteString(fmt.Sprintf("\nVERIFIED: %d files were created by this run.\n", len(newFiles)))
+	if len(newFiles) > 0 {
+		sb.WriteString("Files this run actually wrote to disk:\n")
+		names := make([]string, 0, len(newFiles))
+		for _, f := range newFiles {
+			names = append(names, fmt.Sprintf("%s (%d bytes)", f.Path, f.Size))
+		}
+		sb.WriteString(strings.Join(names, ", ") + "\n")
+	} else {
+		sb.WriteString("(no files were written by this run)\n")
+	}
+
+	prompt := "You are a strict goal checker for a swarm of agents. Judge whether the task above is FULLY complete, " +
+		"based ONLY on the verified outcome — the files this run actually wrote to disk and the per-subtask reports — never on what an agent merely claimed. " +
+		"If any part is missing or failed (a screenshot that was not saved, a file that does not exist, a broken feature), the task is NOT done.\n" +
+		"If it is fully complete, return {\"done\": true, \"gaps\": \"\", \"fix_plan\": []}.\n" +
+		"If it is not, return {\"done\": false, \"gaps\": \"<precise list of what is missing>\", \"fix_plan\": [<concrete new subtask prompts>]}. " +
+		"RULES for the fix_plan: (1) never repeat a failed approach — replace it with an ALTERNATIVE (a different site, a different URL, a different method); " +
+		"(2) each fix subtask must be independent and self-contained; " +
+		"(3) produce exactly as many fix subtasks as there are missing results — aim to reach the goal count, not just to try again; " +
+		"(4) keep every subtask a single sentence of instruction.\n" +
+		"Return ONLY JSON, no markdown, no extra text.\n\n" + sb.String()
+
+	out, err := orch.Generate(ctx, "You are a strict goal checker for a swarm of agents.", []llm.Turn{{Role: "user", Text: prompt}}, nil)
+	if err != nil {
+		s.emit(Event{Time: time.Now(), Type: "warning", Detail: "goal verification failed: " + truncate(err.Error(), 200)})
+		return goalVerdict{Done: true} // a broken verifier must not loop the run forever
+	}
+	s.emit(Event{Time: time.Now(), Type: "usage", Agent: "orchestrator", Model: orch.Model(), Usage: out.Usage})
+
+	v, err := parseGoalVerdict(out.Text)
+	if err != nil {
+		s.emit(Event{Time: time.Now(), Type: "warning", Detail: "goal verification unparsable: " + truncate(err.Error(), 200)})
+		return goalVerdict{Done: true}
+	}
+	if !v.Done && len(v.FixPlan) == 0 {
+		s.emit(Event{Time: time.Now(), Type: "warning", Detail: "verifier reported gaps but no fix plan"})
+	}
+	return v
+}
+
+// parseGoalVerdict decodes the verifier's verdict from raw model output,
+// tolerating markdown fences and surrounding prose.
+func parseGoalVerdict(raw string) (goalVerdict, error) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+	start := strings.Index(raw, "{")
+	end := strings.LastIndex(raw, "}")
+	if start < 0 || end <= start {
+		return goalVerdict{}, fmt.Errorf("no JSON object in verifier output")
+	}
+	var v goalVerdict
+	if err := json.Unmarshal([]byte(raw[start:end+1]), &v); err != nil {
+		return goalVerdict{}, err
+	}
+	return v, nil
+}
+
+// subtaskDigest renders completed subtask results as a compact hand-off text
+// for the fix-round workers, so they build on what exists instead of redoing
+// it (and see which parts failed and must be replaced with alternatives).
+func (s *Swarm) subtaskDigest(subs []SubtaskResult) string {
+	var sb strings.Builder
+	for _, sr := range subs {
+		if sr.Error != "" {
+			fmt.Fprintf(&sb, "- [FAILED] %s: %s\n", truncate(sr.Task, 120), truncate(sr.Error, 200))
+			continue
+		}
+		files := ""
+		if len(sr.Files) > 0 {
+			files = " (files: " + strings.Join(sr.Files, ", ") + ")"
+		}
+		fmt.Fprintf(&sb, "- [%s] %s: %s%s\n", sr.Agent, truncate(sr.Task, 120), truncate(sr.Summary, 300), files)
+	}
+	return sb.String()
 }
 
 // reviewVerdict is the decoded output of the self-review pass: either the work is
@@ -779,9 +1065,11 @@ func (s *Swarm) fileNames() []string {
 }
 
 // finalize produces the final answer for a swarm run by summarising the
-// subtask results with a single agent (no tools). It returns the text, the
-// model used, and the token usage.
-func (s *Swarm) finalize(ctx context.Context, a Agent, task string, subs []SubtaskResult) (string, string, llm.Usage, error) {
+// subtask results with a single agent (no tools). The summary is grounded in
+// the verified workspace file list: the summarizer may only claim results
+// that actually exist on disk and must state how many deliverables succeeded
+// versus failed. It returns the text, the model used, and the token usage.
+func (s *Swarm) finalize(ctx context.Context, a Agent, task string, subs []SubtaskResult, files []workspace.FileInfo) (string, string, llm.Usage, error) {
 	var sb strings.Builder
 	for _, sr := range subs {
 		if sr.Error != "" {
@@ -790,12 +1078,25 @@ func (s *Swarm) finalize(ctx context.Context, a Agent, task string, subs []Subta
 		}
 		sb.WriteString(fmt.Sprintf("- [%s / %s] %s: %s\n", sr.Agent, sr.Model, sr.Task, truncate(sr.Summary, 160)))
 	}
+	if len(files) > 0 {
+		sb.WriteString("\nVerified files that actually exist in the workspace:\n")
+		for _, f := range files {
+			sb.WriteString("- " + f.Path + "\n")
+		}
+	} else {
+		sb.WriteString("\nVerified workspace state: no files exist in the workspace.\n")
+	}
 
 	prompt := fmt.Sprintf(
 		"You are the final summarizer for a swarm of coding agents.\n"+
 			"Overall task:\n%s\n\n"+
 			"What the agents did:\n%s\n\n"+
-			"Write a concise, human-readable answer to the user describing what was done and the result. Mention any files created and how to use them. Reply in the same language as the task.",
+			"Write a concise, human-readable answer to the user describing what was done and the result. "+
+			"STRICT RULES: (1) claim only what the verified file list above proves — never trust an agent's claim that a file exists if it is not in the list; "+
+			"(2) explicitly count the result: how many deliverables succeeded and how many failed, e.g. \"17 of 20 screenshots saved\"; "+
+			"(3) mention any files created and how to use them; "+
+			"(4) if the task involved a plan, an architecture, a data flow or a multi-step process, include a mermaid diagram (```mermaid flowchart or sequenceDiagram) so the user can see the structure. "+
+			"Reply in the same language as the task.",
 		task, sb.String())
 
 	model := s.cfg.DefaultModel
@@ -823,9 +1124,13 @@ func (s *Swarm) RunSingle(ctx context.Context, a Agent, history []llm.Turn) (*Re
 		defer s.cfg.Workspace.CleanupProcesses()
 	}
 
+	// Live browser frames for the single-agent mode as well.
+	s.startBrowserFrames(ctx, 2*time.Second)
+
 	model := resolveModel(a, nil, s.cfg.DefaultModel)
 	s.emit(Event{Time: time.Now(), Type: "planning", Agent: a.Name, Model: model, Detail: "single agent answering"})
 
+	beforeSet := s.snapshotFiles()
 	agRes, usedModel, err := s.runWorker(ctx, a, model, "", history)
 	if err != nil {
 		return nil, err
@@ -842,9 +1147,46 @@ func (s *Swarm) RunSingle(ctx context.Context, a Agent, history []llm.Turn) (*Re
 	}}
 	res.Usage = append(res.Usage, UsageRecord{Agent: a.Name, Model: usedModel, Usage: agRes.Usage})
 	res.Transcript = append(res.Transcript, TranscriptEntry{Agent: a.Name, Role: "assistant", Text: agRes.Summary})
-	if s.cfg.Workspace != nil {
-		res.Files, _ = s.cfg.Workspace.ListFiles()
+	res.Files, _ = s.listFiles()
+
+	// Single mode counts RESULTS too: verify the goal against what the agent
+	// actually produced, and run fix rounds (with alternative approaches) while
+	// the deliverable is incomplete.
+	orchModel := s.cfg.OrchestratorModel
+	if isOpenAI(a.Provider) {
+		orchModel = "deepseek-chat"
 	}
+	if orch, oerr := s.buildClient(a, orchModel); oerr == nil {
+		s.verifyAndFix(ctx, orch, res.Task, res, "", beforeSet, func(fixPlan []string, digest string) ([]SubtaskResult, []UsageRecord) {
+			var subs []SubtaskResult
+			var usage []UsageRecord
+			for _, fix := range fixPlan {
+				txt := fix
+				if digest != "" {
+					txt += "\n\nAlready completed in this run (reuse these results, do not redo them):\n" + digest
+				}
+				fr, uModel, ferr := s.runWorker(ctx, a, model, "", []llm.Turn{{Role: "user", Text: txt}})
+				if ferr != nil {
+					subs = append(subs, SubtaskResult{Task: fix, Agent: a.Name, Model: uModel, Summary: "failed: " + ferr.Error()})
+					continue
+				}
+				subs = append(subs, SubtaskResult{Task: fix, Agent: a.Name, Model: uModel, Summary: fr.Summary, ToolCalls: fr.ToolCalls, Files: fr.Files, Usage: fr.Usage})
+				usage = append(usage, UsageRecord{Agent: a.Name, Model: uModel, Usage: fr.Usage})
+			}
+			return subs, usage
+		})
+	} else {
+		s.emit(Event{Time: time.Now(), Type: "warning", Detail: "goal verification unavailable: " + truncate(oerr.Error(), 200)})
+	}
+
+	// The final answer is grounded in the verified file list, so it counts
+	// real results ("6 of 6 saved"), not claimed ones.
+	if final, fmodel, fusage, ferr := s.finalize(ctx, a, res.Task, res.Subtasks, res.Files); ferr == nil && strings.TrimSpace(final) != "" {
+		res.Final = final
+		res.Usage = append(res.Usage, UsageRecord{Agent: a.Name, Model: fmodel, Usage: fusage})
+		s.emit(Event{Time: time.Now(), Type: "usage", Agent: a.Name, Model: fmodel, Usage: fusage})
+	}
+
 	return res, nil
 }
 
@@ -880,10 +1222,11 @@ func (s *Swarm) emit(e Event) {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(r[:n]) + "..."
 }
 
 func (s *Swarm) plan(ctx context.Context, orch llm.Client, task string, images []llm.Image, prior []llm.Turn) (orchestration, llm.Usage, error) {
@@ -1055,9 +1398,11 @@ func (s *Swarm) runWorker(ctx context.Context, a Agent, model, systemExtra strin
 			Proxy:         a.Proxy,
 			Log:           s.workerLog(a, client),
 			OnUsage:       s.usageLog(a, client),
+			OnSession:     func(sess *browser.Session) { s.registerSession(a.Name, sess) },
 			DisabledTools: agent.DisabledToolNames(s.cfg.DisabledModules),
 			SystemExtra:   systemExtra,
 			MaxIterations: s.maxIterations(),
+			ContextBytes:  s.cfg.ContextBytes,
 		})
 		res, err := ag.RunWithHistory(ctx, history)
 		if err == nil {
@@ -1116,9 +1461,7 @@ func DirectionFor(tool string) string {
 		"browser_navigate", "browser_snapshot", "browser_text", "browser_screenshot",
 		"desktop_windows", "desktop_screenshot":
 		return "read"
-	case "write_file", "edit_file", "run_command",
-		"desktop_launch", "desktop_focus", "desktop_move", "desktop_click",
-		"desktop_type", "desktop_key", "desktop_scroll":
+	case "write_file", "edit_file", "run_command":
 		return "write"
 	default:
 		return "other"

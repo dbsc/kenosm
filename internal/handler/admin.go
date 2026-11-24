@@ -1,12 +1,14 @@
 package handler
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -22,11 +24,12 @@ var (
 
 // Admin exposes CRUD endpoints for configuring services (upstream + proxy).
 type Admin struct {
-	repo *repository.ServiceRepo
+	repo         *repository.ServiceRepo
+	allowPrivate bool // permit upstream URLs resolving to RFC1918 ranges
 }
 
-func NewAdmin(repo *repository.ServiceRepo) *Admin {
-	return &Admin{repo: repo}
+func NewAdmin(repo *repository.ServiceRepo, allowPrivate bool) *Admin {
+	return &Admin{repo: repo, allowPrivate: allowPrivate}
 }
 
 // serviceInput uses pointer fields so partial updates can distinguish
@@ -49,8 +52,8 @@ type serviceInput struct {
 
 func (a *Admin) Create(w http.ResponseWriter, r *http.Request) {
 	var in serviceInput
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if err := decodeJSON(w, r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -70,7 +73,7 @@ func (a *Admin) Create(w http.ResponseWriter, r *http.Request) {
 		Enabled:        defaultBool(in.Enabled, true),
 	}
 
-	if err := validateService(&svc); err != nil {
+	if err := a.validateService(&svc); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -118,8 +121,8 @@ func (a *Admin) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var in serviceInput
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if err := decodeJSON(w, r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -170,7 +173,7 @@ func (a *Admin) Update(w http.ResponseWriter, r *http.Request) {
 		svc.Enabled = *in.Enabled
 	}
 
-	if err := validateService(&svc); err != nil {
+	if err := a.validateService(&svc); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -200,7 +203,7 @@ func (a *Admin) Delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func validateService(s *model.Service) error {
+func (a *Admin) validateService(s *model.Service) error {
 	if s.Slug == "" {
 		return errors.New("slug is required")
 	}
@@ -217,13 +220,61 @@ func validateService(s *model.Service) error {
 	if u.Host == "" {
 		return errors.New("upstream_url must include a host")
 	}
-	if s.ProxyHost == "" {
-		return errors.New("proxy_host is required")
+	if reason := blockedUpstreamReason(u.Hostname(), a.allowPrivate); reason != "" {
+		return errors.New(reason)
 	}
-	if s.ProxyPort < 1 || s.ProxyPort > 65535 {
-		return errors.New("proxy_port must be between 1 and 65535")
+	// The SOCKS5 proxy is optional: services (and their agents) may connect
+	// directly. When a host is given, the port must be sane.
+	if s.ProxyHost != "" {
+		if s.ProxyPort < 1 || s.ProxyPort > 65535 {
+			return errors.New("proxy_port must be between 1 and 65535")
+		}
 	}
 	return nil
+}
+
+// blockedUpstreamReason reports why a gateway upstream host must not be used,
+// or "" when it is allowed. Loopback and link-local targets (cloud metadata
+// services, the host itself) are always refused; private RFC1918/ULA ranges
+// require the ALLOW_PRIVATE_UPSTREAM opt-in. Hostnames are resolved so a name
+// pointing at 169.254.169.254 cannot slip through.
+func blockedUpstreamReason(hostname string, allowPrivate bool) string {
+	block := func(why string) string { return "upstream_url host " + hostname + " is not allowed: " + why }
+
+	if ip := net.ParseIP(hostname); ip != nil {
+		if ip.IsLoopback() {
+			return block("loopback addresses can reach the server itself")
+		}
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return block("link-local addresses (e.g. cloud metadata) are refused")
+		}
+		if ip.IsPrivate() && !allowPrivate {
+			return block("private ranges require ALLOW_PRIVATE_UPSTREAM=true")
+		}
+		return ""
+	}
+
+	lower := strings.ToLower(hostname)
+	if lower == "localhost" || strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal") {
+		return block("local hostnames are refused")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", hostname)
+	cancel()
+	if err != nil {
+		// Unresolvable hosts fail at request time anyway; allow configuration.
+		return ""
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return block("resolves to a loopback/link-local address (e.g. cloud metadata)")
+		}
+		if ip.IsPrivate() && !allowPrivate {
+			return block("resolves to a private range; set ALLOW_PRIVATE_UPSTREAM=true to permit")
+		}
+	}
+	return ""
 }
 
 func writeRepoError(w http.ResponseWriter, err error) {

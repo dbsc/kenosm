@@ -2,6 +2,61 @@ package llm
 
 import "testing"
 
+func TestOpenAISchemaConvertsGeminiTypes(t *testing.T) {
+	tools := []Tool{{
+		Name:        "write_file",
+		Description: "write",
+		Parameters: map[string]any{
+			"type":       "OBJECT",
+			"properties": map[string]any{
+				"path":    map[string]any{"type": "STRING"},
+				"content": map[string]any{"type": "STRING"},
+				"count":   map[string]any{"type": "NUMBER"},
+			},
+			"required": []any{"path", "content"},
+		},
+	}}
+
+	out := toOpenAITools(tools)
+	if len(out) != 1 {
+		t.Fatalf("len = %d, want 1", len(out))
+	}
+	params := out[0].Function.Parameters
+	if params["type"] != "object" {
+		t.Fatalf("top-level type = %v, want object", params["type"])
+	}
+	props := params["properties"].(map[string]any)
+	for _, key := range []string{"path", "content"} {
+		if props[key].(map[string]any)["type"] != "string" {
+			t.Fatalf("%s.type = %v, want string", key, props[key].(map[string]any)["type"])
+		}
+	}
+	if props["count"].(map[string]any)["type"] != "number" {
+		t.Fatalf("count.type = %v, want number", props["count"].(map[string]any)["type"])
+	}
+	req, _ := params["required"].([]any)
+	if len(req) != 2 || req[0] != "path" || req[1] != "content" {
+		t.Fatalf("required = %v, want [path content]", req)
+	}
+}
+
+func TestOpenAISchemaHandlesNested(t *testing.T) {
+	in := map[string]any{
+		"type": "OBJECT",
+		"properties": map[string]any{
+			"nested": map[string]any{"type": "ARRAY", "items": map[string]any{"type": "BOOLEAN"}},
+		},
+	}
+	out := openaiSchema(in).(map[string]any)
+	nested := out["properties"].(map[string]any)["nested"].(map[string]any)
+	if nested["type"] != "array" {
+		t.Fatalf("nested type = %v, want array", nested["type"])
+	}
+	if nested["items"].(map[string]any)["type"] != "boolean" {
+		t.Fatal("items type must be lowercase boolean")
+	}
+}
+
 func TestToOpenAIMessages(t *testing.T) {
 	msgs := toOpenAIMessages("sys", []Turn{
 		{Role: "user", Text: "hello"},

@@ -114,6 +114,12 @@ func (r *socksRelay) handle(c net.Conn) {
 	go func() { _, _ = io.Copy(up, c); errc <- struct{}{} }()
 	go func() { _, _ = io.Copy(c, up); errc <- struct{}{} }()
 	<-errc
+	// One direction finished (EOF or error): close both ends so the other
+	// io.Copy goroutine unblocks, then wait for it so no copy goroutine
+	// outlives the handler.
+	_ = c.Close()
+	_ = up.Close()
+	<-errc
 }
 
 func readSocksAddr(c net.Conn, buf []byte) (host string, port int, err error) {

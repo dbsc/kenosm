@@ -19,6 +19,20 @@ func TestCacheBuildsTransportWithAuth(t *testing.T) {
 	}
 }
 
+func TestCacheBuildsDirectTransportWithoutProxy(t *testing.T) {
+	c := NewCache()
+	tr, err := c.Get(ProxySpec{})
+	if err != nil {
+		t.Fatalf("Get(direct): %v", err)
+	}
+	if tr == nil {
+		t.Fatal("expected non-nil transport for direct connections")
+	}
+	if tr.DialContext != nil {
+		t.Fatal("direct transport must not carry a SOCKS5 DialContext")
+	}
+}
+
 func TestCacheBuildsTransportWithoutAuth(t *testing.T) {
 	c := NewCache()
 	spec := ProxySpec{Host: "127.0.0.1", Port: 1080}
