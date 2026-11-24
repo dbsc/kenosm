@@ -1,20 +1,27 @@
 # kenosm
 
-Один бинарь — API-гейтвей, SOCKS5-прокси и рой автономных агентов с браузером,
-которые сами верстают сайты, ходят по страницам, делают скриншоты и проверяют
-свою работу. Настраиваешь любой AI API (upstream) + прокси — и получаешь готовый
-endpoint, а поверх него — многоагентный оркестратор с веб-интерфейсом.
+Один бинарь — настольное приложение, HTTP API + reverse-proxy и рой автономных
+агентов с настоящим браузером. Агенты сами верстают сайты, ходят по страницам,
+делают скриншоты и проверяют свою работу. Настраиваешь любой AI API (Gemini или
+любой OpenAI-совместимый, например DeepSeek) — и получаешь готовый endpoint, а
+поверх него — многоагентный оркестратор с веб-интерфейсом.
 
 ## Возможности
 
-- **API-гейтвей**: связка `upstream API` + `SOCKS5 proxy`, endpoint вида
-  `/proxy/<slug>/<путь>`. Секреты (ключ API и пароль прокси) шифруются AES-256-GCM.
+- **Настольное приложение** (`kenosm app`): веб-интерфейс в нативном окне
+  (WebKitGTK / Cocoa / Edge WebView2). При первом запуске само генерирует `.env`,
+  поднимает PostgreSQL и стартует сервер — без ручной настройки ключей.
+- **API-гейтвей**: связка `upstream API` + (опционально) `SOCKS5 proxy`, endpoint
+  вида `/proxy/<slug>/<путь>`. Секреты (ключ API и пароль прокси) шифруются
+  AES-256-GCM. Прокси необязателен — можно добавлять сервисы напрямую.
 - **Рой агентов**: включённые сервисы становятся агентами; планировщик разбивает
   задачу на подзадачи и раздаёт их параллельно (work-stealing, без «волн»).
 - **Настоящий браузер** у каждого агента (headless Chromium, живая сессия):
   навигация, клики, ввод текста, скролл, скриншоты, чтение страницы и CAPTCHA.
 - **Рабочий стол** (опционально): запуск программ, фокус окон, скриншоты экрана,
   ввод мыши/клавиатуры через `xdotool`/`ydotool`/`uinput` (X11 и Wayland).
+- **Выбор рабочей папки**: как в Claude Code — можно указать любую директорию на
+  диске, где агенты будут читать и писать файлы (браузер папок в UI).
 - **Режим Polish**: саморецензирование — рой переделывает результат, пока
   ревьюер не одобрит (или не кончится бюджет раундов).
 - **Дизайн-библиотека** в поставке: ~7500 SVG-иконок (Lucide + Tabler), анимированные
@@ -24,57 +31,97 @@ endpoint, а поверх него — многоагентный оркестр
   таймлайн параллельной работы.
 - **Toggle-модули инструментов**: files / shell / browser / desktop — включаются
   отдельно (веб-интерфейс или `DISABLED_MODULES`).
-- **SSE-стрим** прогресса каждого запуска.
+- **Голосовой ввод** (опционально): запись с микрофона и транскрипция через
+  внешний `STT_CMD` (`stt/transcribe.py`, faster-whisper).
+- **SSE-стрим** прогресса каждого запуска; кнопка «follow» для автопрокрутки.
+
+## Установка и запуск
+
+### Настольное приложение (самый простой путь)
+
+```bash
+make build            # соберёт bin/kenosm (CGO) и bin/kenosm-server
+./bin/kenosm app      # откроет UI в нативном окне
+```
+
+`kenosm app` при первом запуске сам:
+1. создаст `.env` (сгенерирует `SECRET_KEY` и `KENOSM_API_KEY`), если его нет;
+2. поднимет PostgreSQL через `docker compose up -d db`;
+3. применит миграции и запустит сервер;
+4. откроет окно с уже авторизованным веб-интерфейсом.
+
+После этого приложение просто запускается и работает — ничего настраивать не надо.
+
+### Терминал / сервер
+
+```bash
+make db-up            # Postgres (docker compose up -d db)
+make build            # bin/kenosm + bin/kenosm-server
+./bin/kenosm          # = kenosm serve — API + гейтвей + веб-интерфейс
+./bin/kenosm chat     # терминальный чат с роем (Claude-Code style)
+./bin/kenosm chat --serve   # сначала поднять сервер, потом чат
+./bin/kenosm setup    # интерактивный мастер (.env + база)
+./bin/kenosm version  # версия
+```
+
+Веб-интерфейс — на `http://localhost:8080` (вкладки **Chat**, **Tools**, **Stats**).
+Сервер слушает `:8080` (меняется через `ADDR`).
+
+Установка в `PATH`: `make install` — скопирует `bin/kenosm` в `~/.local/bin`.
+
+### Быстрый старт без приложения
+
+```bash
+make db-up                 # 1. Postgres
+cp .env.example .env       # 2. конфиг (опционально — есть дефолты)
+make run                   # 3. go run ./cmd/kenosm (миграции применятся сами)
+```
+
+Если `KENOSM_API_KEY` пуст, API и прокси работают без авторизации (режим
+разработки). Чтобы закрыть доступ — задай ключ (или запусти `kenosm setup`,
+который сгенерирует его сам).
 
 ## Стек
 
-- **Go** — один бинарь: нативный reverse-proxy, оркестратор, встроенный веб-интерфейс.
+- **Go** — один бинарь: нативный reverse-proxy, оркестратор, встроенный веб-интерфейс,
+  нативное окно (cgo + WebKitGTK/Cocoa/WebView2).
 - **PostgreSQL 16** (Docker) — конфиги сервисов, чаты, логи запросов и статистика.
 - **chi** (роутер), **pgx** (драйвер), **goose** (миграции), **x/net/proxy** (SOCKS5).
 - **chromedp** — headless Chromium для браузера агентов.
-- Ключ шифрования — `SECRET_KEY` из окружения.
+- Ключ шифрования — `SECRET_KEY` из окружения (AES-256-GCM).
 
 ## Структура
 
 ```
-cmd/server/            точка входа
-cmd/rekey/             перешифровка секретов при смене SECRET_KEY
+cmd/
+  kenosm/        точка входа: serve / chat / app / setup / version
+  server/        тонкий алиас для `kenosm serve` (бинарник kenosm-server)
+  rekey/         перешифровка секретов при смене SECRET_KEY
+  cursortest/    одноразовый тестер курсора/кликов рабочего стола (вне сборки)
 internal/
-  config/              конфигурация из env (+ .env)
-  crypto/              AES-256-GCM
-  db/                  пул соединений + миграции (goose, embed)
-  model/               модели данных
-  repository/          доступ к данным (services, request_logs, usage, chats, activity)
-  transport/           SOCKS5-кэш http.Transport'ов + локальный SOCKS5-relay (auth-инъекция)
-  llm/                 клиенты Gemini / OpenAI-совместимые (DeepSeek), фолбэк моделей
-  agent/               агент: системный промпт, инструменты, цикл, лимит итераций
-  swarm/               оркестратор: планирование, work-stealing, polish-режим
-  browser/             браузер агента (chromedp) + прокси на агента
-  desktop/             запуск/скриншоты/ввод мыши и клавиатуры
-  handler/             HTTP: admin CRUD, gateway, swarm, chat, workspace, stats
-  logging/             асинхронное логирование прокси-запросов
-  server/              сборка роутера
-  webui/               встроенный фронтенд (embed)
-assets/                дизайн-библиотека (версионируется, сеется в workspace)
-workspace/             runtime-каталог агентов (gitignored, восстанавливается)
+  app/           сборка: конфиг, БД, сервисы, роутер, graceful shutdown
+  config/        конфигурация из env (+ .env), дефолты
+  crypto/        AES-256-GCM
+  db/            пул соединений + миграции (goose, embed)
+  model/         модели данных
+  repository/    доступ к данным (services, request_logs, usage, chats, activity)
+  transport/     SOCKS5-кэш http.Transport'ов + локальный SOCKS5-relay (auth-инъекция)
+  llm/           клиенты Gemini / OpenAI-совместимые (DeepSeek), фолбэк моделей
+  agent/         агент: системный промпт, инструменты, цикл, лимит итераций
+  swarm/         оркестратор: планирование, work-stealing, polish-режим
+  browser/       браузер агента (chromedp) + прокси на агента
+  desktop/       запуск/скриншоты/ввод мыши и клавиатуры
+  workspace/     песочница рабочей папки: файлы, shell, cleanup процессов
+  handler/       HTTP: admin CRUD, gateway, swarm, chat, workspace, voice, stats
+  logging/       асинхронное логирование прокси-запросов
+  pricing/       таблица цен моделей + расчёт стоимости
+  server/        сборка роутера
+  webui/         встроенный фронтенд (embed)
+  webview/       cgo-обёртка нативного окна
+stt/             опциональный Python-хелпер speech-to-text (venv не коммитится)
+assets/          дизайн-библиотека (версионируется, сеется в workspace)
+workspace/       runtime-каталог агентов (gitignored, восстанавливается)
 ```
-
-## Быстрый старт
-
-```bash
-# 1. Postgres
-make db-up            # docker compose up -d db
-
-# 2. конфиг
-cp .env.example .env  # при желании задать SECRET_KEY / KENOSM_API_KEY
-
-# 3. собрать и запустить (миграции применятся автоматически)
-make build            # go build -o bin/kenosm ./cmd/server
-./bin/kenosm          # или: make run
-```
-
-Веб-интерфейс — на `http://localhost:8080` (вкладки **Chat**, **Tools**, **Stats**).
-Сервис слушает `:8080` (меняется через `ADDR`).
 
 ## Конфигурация
 
@@ -97,6 +144,10 @@ make build            # go build -o bin/kenosm ./cmd/server
 | `AGENT_MAX_ITERATIONS` | `50` | максимум шагов (tool-call) агента на подзадачу |
 | `LOG_RETENTION_DAYS` | `30` | срок хранения логов прокси (0 — не чистить) |
 | `MODEL_PRICES` | встроенная таблица | переопределение цен (USD/1M токенов) |
+| `STT_CMD` | пусто (голос выключен) | команда транскрипции аудио (см. `stt/transcribe.py`) |
+
+`kenosm app` и `kenosm setup` генерируют `SECRET_KEY`/`KENOSM_API_KEY` в `.env`
+автоматически, так что вручную их задавать не нужно.
 
 ## API
 
@@ -125,10 +176,11 @@ curl -X PUT http://localhost:8080/api/v1/services/<id> \
 curl -X DELETE http://localhost:8080/api/v1/services/<id> # удалить
 ```
 
-Поля: `slug` (`[a-z0-9-]`, уникальный), `upstream_url` (`http(s)://host[/base]`),
-`proxy_host`/`proxy_port` обязательны; `auth_header`/`auth_scheme` по умолчанию
-`Authorization: Bearer <key>`; `enabled` — по умолчанию `true`. Секреты в ответах
-не возвращаются — вместо них флаги `has_api_key`/`has_proxy_password`.
+Поля: `slug` (`[a-z0-9-]`, уникальный), `upstream_url` (`http(s)://host[/base]`).
+`proxy_host`/`proxy_port` **необязательны** — без них запросы идут напрямую.
+`auth_header`/`auth_scheme` по умолчанию `Authorization: Bearer <key>`; `enabled` —
+по умолчанию `true`. Секреты в ответах не возвращаются — вместо них флаги
+`has_api_key`/`has_proxy_password`.
 
 ### Прокси-гейтвей
 
@@ -138,8 +190,9 @@ curl http://localhost:8080/proxy/openai/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Запрос уходит на `https://api.openai.com/v1/chat/completions` **через SOCKS5**,
-с автоматически подставленным `Authorization: Bearer sk-...`. Стриминг (SSE) поддержан.
+Запрос уходит на `https://api.openai.com/v1/chat/completions` (при заданном прокси —
+через SOCKS5) с автоматически подставленным `Authorization: Bearer sk-...`.
+Стриминг (SSE) поддержан.
 
 ### Запуск задачи роем
 
@@ -185,17 +238,25 @@ curl -X POST http://localhost:8080/api/v1/chats/<id>/messages \
 curl -X DELETE http://localhost:8080/api/v1/chats/<id>      # удалить
 ```
 
-Режим сообщения:
+Необязательное поле `agent` (slug сервиса) сужает работу до одного конкретного
+агента (аналог `mode:"single"`, но с явным выбором модели). Режим сообщения:
 - **single** — работает один агент (быстро, с полной историей).
 - **swarm** — весь рой: планировщик делит задачу на параллельные подзадачи.
 - **polish** — рой + цикл саморецензирования до одобрения.
 
-### Workspace и статистика
+### Workspace, рабочая папка и статистика
 
 ```bash
 curl http://localhost:8080/api/v1/workspace/files            # список файлов
 curl http://localhost:8080/api/v1/workspace/files/<path>     # файл (картинки — base64)
 curl -X POST http://localhost:8080/api/v1/workspace/clear    # очистить workspace
+
+# выбор рабочей папки (как в Claude Code) — любая директория на диске
+curl http://localhost:8080/api/v1/workspace/root             # текущая рабочая папка
+curl -X POST http://localhost:8080/api/v1/workspace/root \
+  -H 'Content-Type: application/json' -d '{"path":"/home/me/project"}'  # сменить
+curl http://localhost:8080/api/v1/fs/home                    # домашний каталог пользователя
+curl "http://localhost:8080/api/v1/fs/dirs?path=/home/me"    # подпапки (браузер папок)
 
 curl http://localhost:8080/api/v1/activity?limit=100         # активность (read/write/…)
 curl http://localhost:8080/api/v1/activity?run_id=<id>       # активность одного запуска
@@ -203,11 +264,26 @@ curl http://localhost:8080/api/v1/runs/<id>/timeline         # таймлайн 
 curl http://localhost:8080/api/v1/stats                      # суммарные траты
 ```
 
+Смена рабочей папки отклоняется, пока идёт запуск (чтобы не оставить агентов без
+файлов на середине задачи).
+
+### Голосовой ввод
+
+```bash
+curl -X POST http://localhost:8080/api/v1/voice/start        # начать запись с микрофона
+curl -X POST http://localhost:8080/api/v1/voice/stop         # остановить и транскрибировать
+curl -X POST http://localhost:8080/api/v1/transcribe         # транскрибировать готовый клип
+```
+
+Работает в нативном окне (WebKitGTK), где браузерный `getUserMedia` запрещён.
+Требует внешнюю команду в `STT_CMD` (см. готовый `stt/transcribe.py`, faster-whisper);
+пока она не задана, голосовой ввод возвращает «not configured».
+
 ## Рой: как это работает
 
 **Агенты** — это включённые (`enabled`) сервисы: `upstream_url` = базовый URL модели,
-`upstream_api_key` = ключ, `proxy_*` = SOCKS5. У каждого агента свой браузер со своим
-прокси (через локальный SOCKS5-relay, подставляющий авторизацию).
+`upstream_api_key` = ключ, `proxy_*` = SOCKS5 (опционально). У каждого агента свой
+браузер со своим прокси (через локальный SOCKS5-relay, подставляющий авторизацию).
 
 Планировщик сначала решает, нужен ли рой: разговорный запрос («Привет», короткий
 вопрос) отвечает напрямую. Иначе строит **структуру** — подзадачи, зависимости,
@@ -275,6 +351,8 @@ python3 assets/uiux/scripts/search.py "<продукт>" --design-system --varia
   без потери данных есть `go run ./cmd/rekey` (env: `OLD_SECRET`, `NEW_SECRET`).
 - `KENOSM_API_KEY` закрывает `/api/v1/*` и `/proxy/*`: заголовок
   `Authorization: Bearer <key>` или `X-API-Key` (SSE — `?key=`). Пустой ключ — открытый режим.
+  `kenosm app`/`kenosm setup` генерируют ключ в `.env` автоматически.
+- `.env` (с ключами и строкой БД) — в `.gitignore`, в репозиторий не попадает.
 - `MAX_CONCURRENT_RUNS=1` по умолчанию не даёт агентам разных запусков конфликтовать
   за общий workspace.
 - Логи прокси (`request_logs`) подчищаются старше `LOG_RETENTION_DAYS`.
